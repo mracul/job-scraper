@@ -17,10 +17,7 @@ from datetime import datetime
 from collections import defaultdict
 import plotly.express as px
 
-try:
-    from streamlit_plotly_events import plotly_events
-except ImportError:
-    plotly_events = None
+
 
 
 # ============================================================================
@@ -772,21 +769,17 @@ def render_compiled_overview():
                 yaxis={"categoryorder": "total ascending"},
                 showlegend=False,
                 margin=dict(l=0, r=0, t=10, b=10),
+                clickmode="event+select",
+                dragmode="select",
             )
             fig.update_traces(textposition="outside")
-            events = []
-            if plotly_events:
-                events = plotly_events(
-                    fig,
-                    click_event=True,
-                    select_event=False,
-                    hover_event=False,
-                    double_click=True,
-                    override_dblclick=True,
-                    key=f"compiled_plot_{category_key}",
-                )
-            else:
-                st.plotly_chart(fig, use_container_width=True)
+            event_data = st.plotly_chart(
+                fig,
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="points",
+                key=f"compiled_plot_{category_key}",
+            )
 
             st.dataframe(
                 df[["term", "count", "percentage"]].rename(
@@ -824,8 +817,9 @@ def render_compiled_overview():
                         )
                         st.rerun()
 
-            if events:
-                term_clicked = events[0].get("y") or events[0].get("label") or events[0].get("customdata")
+            if event_data and event_data.selection and event_data.selection.points:
+                point = event_data.selection.points[0]
+                term_clicked = point.get("y")
                 if term_clicked:
                     target_candidates = run_term_index.get(category_key, {}).get(term_clicked, [])
                     target_run = None
@@ -939,22 +933,18 @@ def render_report_overview():
                 fig.update_layout(
                     yaxis={"categoryorder": "total ascending"},
                     showlegend=False,
-                    margin=dict(l=0, r=0, t=10, b=10)
+                    margin=dict(l=0, r=0, t=10, b=10),
+                    clickmode="event+select",
+                    dragmode="select",
                 )
                 fig.update_traces(textposition="outside")
-                events = []
-                if plotly_events:
-                    events = plotly_events(
-                        fig,
-                        click_event=True,
-                        select_event=False,
-                        hover_event=False,
-                        double_click=True,
-                        override_dblclick=True,
-                        key=f"report_plot_{category_key}",
-                    )
-                else:
-                    st.plotly_chart(fig, use_container_width=True)
+                event_data = st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                    on_select="rerun",
+                    selection_mode="points",
+                    key=f"report_plot_{category_key}",
+                )
                 
                 # Clickable requirement buttons (double-click effect via single click navigation)
                 st.caption("Click a requirement to view matching jobs:")
@@ -974,8 +964,9 @@ def render_report_overview():
                             )
                             st.rerun()
 
-                if events:
-                    term_clicked = events[0].get("y") or events[0].get("label") or events[0].get("customdata")
+                if event_data and event_data.selection and event_data.selection.points:
+                    point = event_data.selection.points[0]
+                    term_clicked = point.get("y")
                     if term_clicked:
                         navigate_to(
                             "reports",

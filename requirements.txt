@@ -7,4 +7,3 @@ webdriver-manager>=4.0.0
 pytest>=8.0.0
 streamlit>=1.29.0
 plotly>=5.18.0
-streamlit-plotly-events>=0.0.6
