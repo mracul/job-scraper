@@ -27,6 +27,7 @@ import plotly.express as px
 SCRAPED_DATA_DIR = Path(__file__).parent / "scraped_data"
 STATE_DIR = Path(__file__).parent / "state"
 SETTINGS_FILE = STATE_DIR / "ui_settings.json"
+RUN_STATE_FILE = STATE_DIR / "active_run.json"
 LOGS_DIR = Path(__file__).parent / "logs"
 
 DEFAULT_SETTINGS = {
@@ -91,6 +92,68 @@ def save_settings(settings: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
+
+
+def _read_run_state_raw() -> dict | None:
+    """Read persisted run state without validating PID liveness."""
+    if not RUN_STATE_FILE.exists():
+        return None
+    try:
+        with open(RUN_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def save_run_state(pid: int, log_file: str) -> None:
+    """Persist running process info to disk."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(RUN_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"pid": pid, "log_file": log_file, "started": datetime.now().isoformat()}, f)
+
+
+def clear_run_state() -> None:
+    """Remove persisted run state."""
+    if RUN_STATE_FILE.exists():
+        RUN_STATE_FILE.unlink(missing_ok=True)
+
+
+def load_run_state() -> dict | None:
+    """Load persisted run state and verify process is still running."""
+    data = _read_run_state_raw()
+    if not data:
+        return None
+    pid = data.get("pid")
+    if pid:
+        import psutil
+        if psutil.pid_exists(pid):
+            return data
+    return None
+
+
+def _find_latest_run_after(started_at: datetime | None) -> Path | None:
+    """Best-effort: find newest report folder created after a given start time."""
+    if not SCRAPED_DATA_DIR.exists():
+        return None
+    started_ts = started_at.timestamp() if started_at else None
+
+    candidates: list[tuple[float, Path]] = []
+    for folder in SCRAPED_DATA_DIR.iterdir():
+        if not folder.is_dir():
+            continue
+        try:
+            mtime = folder.stat().st_mtime
+        except Exception:
+            continue
+        if started_ts is not None and mtime < (started_ts - 60):
+            continue
+        candidates.append((mtime, folder))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return candidates[0][1]
 
 
 # ============================================================================
@@ -387,6 +450,15 @@ def render_sidebar():
     with st.sidebar:
         st.title("🔍 Job Scraper")
         st.markdown("---")
+        
+        # Show running indicator if scrape is in progress
+        active_run = load_run_state()
+        if active_run or st.session_state.run_process is not None:
+            st.warning("🔄 Scrape running...")
+            if st.button("View Progress", use_container_width=True, type="primary"):
+                navigate_to("new_run")
+                st.rerun()
+            st.markdown("---")
         
         # Navigation
         nav_options = {
@@ -773,21 +845,51 @@ def render_compiled_overview():
                 dragmode="select",
             )
             fig.update_traces(textposition="outside")
-            event_data = st.plotly_chart(
-                fig,
-                use_container_width=True,
-                on_select="rerun",
-                selection_mode="points",
-                key=f"compiled_plot_{category_key}",
-            )
+            st.plotly_chart(fig, use_container_width=True)
 
-            st.dataframe(
-                df[["term", "count", "percentage"]].rename(
-                    columns={"term": "Requirement", "count": "Jobs", "percentage": "% of Total"}
-                ),
+            table_df = df[["term", "count", "percentage"]].rename(
+                columns={"term": "Requirement", "count": "Jobs", "percentage": "% of Total"}
+            )
+            table_state = st.dataframe(
+                table_df,
                 hide_index=True,
                 use_container_width=True,
+                selection_mode="single-row",
+                on_select="rerun",
+                key=f"compiled_table_{category_key}",
             )
+
+            # Streamlit doesn't reliably support clicking Plotly axis labels in-app.
+            # Instead, make the table rows clickable to navigate.
+            selected_rows = []
+            try:
+                selected_rows = (table_state.selection.rows or []) if table_state and table_state.selection else []
+            except Exception:
+                selected_rows = []
+            if selected_rows:
+                row_idx = selected_rows[0]
+                if 0 <= row_idx < len(df):
+                    term_clicked = str(df.iloc[row_idx]["term"])
+                    target_candidates = run_term_index.get(category_key, {}).get(term_clicked, [])
+                    if target_candidates:
+                        target_run = sorted(
+                            target_candidates,
+                            key=lambda t: (t[0], t[1].stat().st_mtime if t[1].exists() else 0),
+                            reverse=True,
+                        )[0][1]
+                    else:
+                        target_run = run_paths[0]
+                    navigate_to(
+                        "reports",
+                        selected_run=str(target_run),
+                        view_mode="explorer",
+                        viewing_job_id=None,
+                        selected_filters={category_key: [term_clicked]},
+                        filter_mode="any",
+                        search_text="",
+                        compiled_runs=[],
+                    )
+                    st.rerun()
 
             st.caption("Click a requirement to view matching jobs:")
             cols = st.columns(min(4, len(sorted_items)))
@@ -817,31 +919,7 @@ def render_compiled_overview():
                         )
                         st.rerun()
 
-            if event_data and event_data.selection and event_data.selection.points:
-                point = event_data.selection.points[0]
-                term_clicked = point.get("y")
-                if term_clicked:
-                    target_candidates = run_term_index.get(category_key, {}).get(term_clicked, [])
-                    target_run = None
-                    if target_candidates:
-                        target_run = sorted(
-                            target_candidates,
-                            key=lambda t: (t[0], t[1].stat().st_mtime if t[1].exists() else 0),
-                            reverse=True,
-                        )[0][1]
-                    else:
-                        target_run = run_paths[0]
-                    navigate_to(
-                        "reports",
-                        selected_run=str(target_run),
-                        view_mode="explorer",
-                        viewing_job_id=None,
-                        selected_filters={category_key: [term_clicked]},
-                        filter_mode="any",
-                        search_text="",
-                        compiled_runs=[],
-                    )
-                    st.rerun()
+            # (Plotly click-to-navigate removed; use table row selection above.)
 
 
 def render_report_overview():
@@ -938,16 +1016,42 @@ def render_report_overview():
                     dragmode="select",
                 )
                 fig.update_traces(textposition="outside")
-                event_data = st.plotly_chart(
-                    fig,
-                    use_container_width=True,
-                    on_select="rerun",
-                    selection_mode="points",
-                    key=f"report_plot_{category_key}",
-                )
+                st.plotly_chart(fig, use_container_width=True)
                 
                 # Clickable requirement buttons (double-click effect via single click navigation)
                 st.caption("Click a requirement to view matching jobs:")
+                table_df = df[["term", "count", "percentage"]].rename(
+                    columns={"term": "Requirement", "count": "Jobs", "percentage": "% of Total"}
+                )
+                table_state = st.dataframe(
+                    table_df,
+                    hide_index=True,
+                    use_container_width=True,
+                    selection_mode="single-row",
+                    on_select="rerun",
+                    key=f"report_table_{category_key}",
+                )
+
+                selected_rows = []
+                try:
+                    selected_rows = (table_state.selection.rows or []) if table_state and table_state.selection else []
+                except Exception:
+                    selected_rows = []
+                if selected_rows:
+                    row_idx = selected_rows[0]
+                    if 0 <= row_idx < len(df):
+                        term_clicked = str(df.iloc[row_idx]["term"])
+                        navigate_to(
+                            "reports",
+                            selected_run=st.session_state.selected_run,
+                            view_mode="explorer",
+                            viewing_job_id=None,
+                            selected_filters={category_key: [term_clicked]},
+                            filter_mode="any",
+                            search_text=""
+                        )
+                        st.rerun()
+
                 cols = st.columns(min(4, len(sorted_items)))
                 for idx, (term, count) in enumerate(sorted_items):
                     col_idx = idx % len(cols)
@@ -963,21 +1067,7 @@ def render_report_overview():
                                 search_text=""
                             )
                             st.rerun()
-
-                if event_data and event_data.selection and event_data.selection.points:
-                    point = event_data.selection.points[0]
-                    term_clicked = point.get("y")
-                    if term_clicked:
-                        navigate_to(
-                            "reports",
-                            selected_run=st.session_state.selected_run,
-                            view_mode="explorer",
-                            viewing_job_id=None,
-                            selected_filters={category_key: [term_clicked]},
-                            filter_mode="any",
-                            search_text=""
-                        )
-                        st.rerun()
+                # (Plotly click-to-navigate removed; use table row selection above.)
 
 
 def render_job_explorer():
@@ -1266,8 +1356,8 @@ def render_new_run_page():
     scraper_settings = settings.get("scraper", {})
     ui_settings = settings.get("ui", {})
     
-    # Check if a run is in progress
-    if st.session_state.run_process is not None:
+    # Check if a run is in progress (either in session or persisted)
+    if st.session_state.run_process is not None or load_run_state() is not None:
         render_run_progress()
         return
     
@@ -1414,6 +1504,7 @@ def render_new_run_page():
             
             st.session_state.run_process = process
             st.session_state.run_log_file = str(log_file)
+            save_run_state(process.pid, str(log_file))
             st.rerun()
 
 
@@ -1421,6 +1512,29 @@ def render_run_progress():
     """Render the progress of a running scrape."""
     process = st.session_state.run_process
     log_file = st.session_state.run_log_file
+    pid = None
+    started_at = None
+
+    # If we lost the process handle (navigated away), try to recover from persisted state
+    if process is None:
+        run_state_raw = _read_run_state_raw() or {}
+        pid = run_state_raw.get("pid")
+        log_file = run_state_raw.get("log_file") or log_file
+        started_raw = run_state_raw.get("started")
+        if isinstance(started_raw, str):
+            try:
+                started_at = datetime.fromisoformat(started_raw)
+            except Exception:
+                started_at = None
+        st.session_state.run_log_file = log_file
+    else:
+        run_state_raw = _read_run_state_raw() or {}
+        started_raw = run_state_raw.get("started")
+        if isinstance(started_raw, str):
+            try:
+                started_at = datetime.fromisoformat(started_raw)
+            except Exception:
+                started_at = None
 
     def _read_log_tail(path: Path, max_lines: int = 400) -> str:
         try:
@@ -1431,9 +1545,17 @@ def render_run_progress():
             return "".join(lines[-max_lines:])
         except Exception:
             return ""
-    
+
+    def _is_running() -> bool:
+        if process is not None:
+            return process.poll() is None
+        if pid:
+            import psutil
+            return psutil.pid_exists(pid)
+        return False
+
     # Check if process is still running
-    if process.poll() is None:
+    if _is_running():
         st.info("🔄 Scraping in progress...")
         
         # Show spinner
@@ -1454,8 +1576,16 @@ def render_run_progress():
         
         # Cancel button
         if st.button("❌ Cancel Run"):
-            process.terminate()
+            if process is not None:
+                process.terminate()
+            elif pid:
+                import psutil
+                try:
+                    psutil.Process(pid).terminate()
+                except Exception:
+                    pass
             st.session_state.run_process = None
+            clear_run_state()
             st.warning("Run cancelled.")
             st.rerun()
         
@@ -1467,13 +1597,41 @@ def render_run_progress():
     
     else:
         # Process finished
-        return_code = process.returncode
+        return_code = None
+        if process is not None:
+            return_code = process.returncode
         st.session_state.run_process = None
+        clear_run_state()
         
         if return_code == 0:
             st.success("✅ Scraping completed successfully!")
-        else:
+        elif return_code is not None:
             st.error(f"❌ Scraping failed with exit code {return_code}")
+        else:
+            st.success("✅ Scraping completed!")
+
+        latest_report = _find_latest_run_after(started_at)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if latest_report and st.button("📊 Review Report", type="primary", use_container_width=True):
+                navigate_to(
+                    "reports",
+                    selected_run=str(latest_report),
+                    view_mode="overview",
+                    viewing_job_id=None,
+                    selected_filters={},
+                    filter_mode="any",
+                    search_text="",
+                )
+                st.rerun()
+        with col2:
+            if st.button("📂 View Reports", use_container_width=True):
+                navigate_to("reports")
+                st.rerun()
+        with col3:
+            if st.button("🚀 Start Another Run", use_container_width=True):
+                st.rerun()
         
         # Show final log
         if log_file and Path(log_file).exists():
@@ -1483,17 +1641,6 @@ def render_run_progress():
             with st.expander("View Full Log", expanded=False):
                 st.text_area("Log Output", log_content, height=400)
         
-        # Navigate to reports
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("📂 View Reports", type="primary"):
-                navigate_to("reports")
-                st.rerun()
-        with col2:
-            if st.button("🚀 Start Another Run"):
-                st.rerun()
-
-
 # ============================================================================
 # Page: Settings
 # ============================================================================
