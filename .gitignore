@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Type check / lint caches
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# Local tooling
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Selenium / browser profiles (persistent user-data-dir)
+.browser_profiles/
+
+# Scrape outputs (runs, compiled reports, job text dumps)
+scraped_data/
+
+# Local run artifacts in repo root
+jobs_*.csv
+jobs_*.json
+compiled_jobs_*.txt
+compiled_jobs_*.md
+requirements_analysis.json
+requirements_analysis.txt
+requirements_index.json
+
+# Local URL/cookie state (can contain sensitive or machine-specific data)
+seen_urls.json
+cookies*.json

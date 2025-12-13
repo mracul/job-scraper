@@ -1,0 +1,546 @@
+""" 
+Job Scraper - Scrape job listings from Seek and Jora (browser mode).
+
+Usage:
+    python main.py --pages 3 --output jobs.csv
+    python main.py  # Interactive mode with browser scraping (default)
+"""
+import argparse
+from datetime import datetime
+from seek_scraper import SeekScraper
+from models import JobCollection
+from url_skip_store import load_seen_urls, add_urls
+from pathlib import Path
+
+# Default search values
+DEFAULT_KEYWORDS = "help desk it"
+DEFAULT_LOCATION = "Auburn NSW"
+DEFAULT_PAGES = 3
+
+# Fuzzy search variants - maps common terms to related keywords for broader coverage
+SEARCH_VARIANTS = {
+    "help desk": ["helpdesk", "service desk", "it support", "desktop support", "technical support"],
+    "helpdesk": ["help desk", "service desk", "it support", "desktop support", "technical support"],
+    "service desk": ["help desk", "helpdesk", "it support", "desktop support", "support analyst"],
+    "it support": ["help desk", "helpdesk", "service desk", "desktop support", "technical support", "it technician"],
+    "desktop support": ["help desk", "it support", "deskside support", "end user support", "desktop technician"],
+    "support analyst": ["service desk analyst", "help desk analyst", "it support analyst", "support specialist"],
+    "system admin": ["sysadmin", "systems administrator", "it administrator", "infrastructure"],
+    "network": ["network engineer", "network administrator", "network technician", "infrastructure"],
+    "junior": ["entry level", "graduate", "trainee", "traineeship"],
+    "trainee": ["traineeship", "junior", "entry level", "graduate"],
+}
+
+
+def expand_search_terms(keywords: str) -> list[str]:
+    """Expand search keywords with fuzzy variants for broader coverage."""
+    keywords_lower = keywords.lower()
+    expanded = [keywords]  # Always include original
+    
+    for term, variants in SEARCH_VARIANTS.items():
+        if term in keywords_lower:
+            for variant in variants:
+                # Replace the term with variant
+                new_search = keywords_lower.replace(term, variant)
+                if new_search not in [k.lower() for k in expanded]:
+                    expanded.append(new_search)
+    
+    return expanded
+
+
+def get_search_parameters() -> tuple[str, str, int, bool]:
+    """Prompt user for search parameters with defaults."""
+    print("\n" + "=" * 60)
+    print("Job Scraper - Search Configuration")
+    print("=" * 60)
+    
+    keywords = input(f"\nEnter job title/keywords [{DEFAULT_KEYWORDS}]: ").strip()
+    if not keywords:
+        keywords = DEFAULT_KEYWORDS
+    
+    location = input(f"Enter location [{DEFAULT_LOCATION}]: ").strip()
+    if not location:
+        location = DEFAULT_LOCATION
+    
+    pages_input = input(f"Enter max pages to scrape [{DEFAULT_PAGES}]: ").strip()
+    if pages_input:
+        try:
+            pages = int(pages_input)
+        except ValueError:
+            pages = DEFAULT_PAGES
+    else:
+        pages = DEFAULT_PAGES
+    
+    # Ask about fuzzy search
+    fuzzy_input = input("Expand search with related terms? (y/N): ").strip().lower()
+    use_fuzzy = fuzzy_input in ('y', 'yes')
+    
+    if use_fuzzy:
+        expanded = expand_search_terms(keywords)
+        if len(expanded) > 1:
+            print(f"\nWill search for: {', '.join(expanded)}")
+    
+    return keywords, location, pages, use_fuzzy
+
+
+def choose_main_action() -> str:
+    """Simple text menu: choose to scrape or analyze requirements."""
+    print("\n" + "=" * 60)
+    print("Job Scraper - Main Menu")
+    print("=" * 60)
+    print("1. Scrape jobs")
+    print("2. Analyze requirements from previous runs")
+    print("3. Exit")
+    
+    while True:
+        choice = input("\nSelect an option [1-3]: ").strip()
+        if choice in {"1", "2", "3"}:
+            return choice
+        print("Please enter 1, 2, or 3.")
+
+
+def list_runs_for_analysis(base_dir: str = "scraped_data") -> list[Path]:
+    """Return sorted list of run folders for analysis (newest first)."""
+    root = Path(base_dir)
+    if not root.exists():
+        return []
+    # Include both old run_ format and new keyword-based folders
+    runs = sorted([p for p in root.iterdir() if p.is_dir()], reverse=True)
+    return runs
+
+
+def read_run_metadata(run_path: Path) -> dict:
+    """Read search metadata from a run's compiled_jobs.md file."""
+    compiled = run_path / "compiled_jobs.md"
+    metadata = {"keywords": None, "location": None, "job_count": 0}
+    
+    if not compiled.exists():
+        return metadata
+    
+    try:
+        with open(compiled, 'r', encoding='utf-8') as f:
+            # Read first 10 lines for header info
+            for _ in range(10):
+                line = f.readline()
+                if not line:
+                    break
+                if line.startswith("**Search Keywords:**"):
+                    metadata["keywords"] = line.replace("**Search Keywords:**", "").strip().rstrip("  ")
+                elif line.startswith("**Search Location:**"):
+                    metadata["location"] = line.replace("**Search Location:**", "").strip().rstrip("  ")
+                elif line.startswith("**Total Jobs:**"):
+                    try:
+                        metadata["job_count"] = int(line.replace("**Total Jobs:**", "").strip())
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    
+    return metadata
+
+
+def analyze_ui():
+    """Interactive UI to select one or more runs and analyze requirements."""
+    from analyze_requirements import JobRequirementsAnalyzer
+    from browse_report import browse_requirements_index
+    runs = list_runs_for_analysis()
+    if not runs:
+        print("\nNo scraped_data runs found yet. Run a scrape first.")
+        return
+    
+    print("\nAvailable runs:")
+    for idx, run in enumerate(runs, start=1):
+        meta = read_run_metadata(run)
+        compiled = run / "compiled_jobs.md"
+        
+        # Build label with search context
+        if meta["keywords"] and meta["keywords"] != "Not specified":
+            label = f"{meta['keywords']}"
+            if meta["location"] and meta["location"] != "Not specified":
+                label += f" - {meta['location']}"
+            if meta["job_count"]:
+                label += f" ({meta['job_count']} jobs)"
+        else:
+            label = run.name
+            if compiled.exists():
+                label += " (compiled_jobs.md)"
+        
+        print(f"  {idx}. {label}")
+    
+    print("\nEnter run numbers to analyze (e.g. 1,3,4) or 'a' for all, or press Enter to cancel.")
+    sel = input("Selection: ").strip()
+    if not sel:
+        return
+    
+    selected_runs: list[Path]
+    if sel.lower() == "a":
+        selected_runs = runs
+    else:
+        try:
+            indices = {int(s) for s in sel.split(",") if s.strip()}
+            selected_runs = [runs[i-1] for i in sorted(indices) if 1 <= i <= len(runs)]
+        except ValueError:
+            print("Invalid selection.")
+            return
+    
+    if not selected_runs:
+        print("No valid runs selected.")
+        return
+    
+    # Ask whether to browse an existing report index or (re)generate analysis
+    mode = input("\nChoose: [1] Browse report (Category→Term→Jobs)  [2] (Re)generate analysis  (default: 1): ").strip()
+    if mode not in {"", "1", "2"}:
+        mode = "1"
+
+    # If browsing, require exactly one run so we know which index to open.
+    if mode in {"", "1"}:
+        if len(selected_runs) != 1:
+            print("\nBrowsing requires selecting exactly one run.")
+            return
+
+        run = selected_runs[0]
+        index_path = run / "requirements_index.json"
+        if not index_path.exists():
+            print("\nNo requirements_index.json found in this run.")
+            gen = input("Generate it now from compiled_jobs.md? (Y/n): ").strip().lower()
+            if gen in {"n", "no"}:
+                return
+
+            compiled = run / "compiled_jobs.md"
+            if not compiled.exists():
+                print("This run doesn't have compiled_jobs.md.")
+                return
+            analyzer = JobRequirementsAnalyzer()
+            jobs = analyzer.extract_jobs_from_markdown(str(compiled))
+            if not jobs:
+                print("No jobs found in compiled_jobs.md.")
+                return
+            analysis = analyzer.analyze_all_jobs(jobs)
+            analyzer.generate_report(analysis, str(run))
+
+        print(f"\nOpening report index: {index_path}")
+        browse_requirements_index(str(index_path))
+        return
+
+    # Otherwise, aggregate jobs from all selected compiled files
+    analyzer = JobRequirementsAnalyzer()
+    all_jobs = []
+    for run in selected_runs:
+        compiled = run / "compiled_jobs.md"
+        if not compiled.exists():
+            continue
+        jobs = analyzer.extract_jobs_from_markdown(str(compiled))
+        all_jobs.extend(jobs)
+    
+    if not all_jobs:
+        print("No compiled job data found in selected runs.")
+        return
+    
+    print(f"\nAnalyzing {len(all_jobs)} jobs from {len(selected_runs)} run(s)...")
+    analysis = analyzer.analyze_all_jobs(all_jobs)
+    # Save a combined report at repo root
+    output_dir = Path(".")
+    report = analyzer.generate_report(analysis, str(output_dir))
+    print(report)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Scrape job listings from Seek and Jora (Browser mode by default)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python main.py                           # Interactive menu (scrape/analyze)
+    python main.py --pages 5                 # More pages when scraping
+    python main.py --output results.csv      # Save to file
+    python main.py --http                    # Use HTTP mode instead
+    python main.py --source seek --format json
+        """
+    )
+    
+    parser.add_argument(
+        "--pages", "-p",
+        type=int,
+        default=3,
+        help="Maximum number of pages to scrape per site (default: 3)"
+    )
+    
+    parser.add_argument(
+        "--source", "-s",
+        choices=["all", "seek", "jora"],
+        default="all",
+        help="Which job site(s) to scrape (default: all)"
+    )
+    
+    parser.add_argument(
+        "--output", "-o",
+        help="Output filename (default: jobs_YYYYMMDD_HHMMSS.csv)"
+    )
+    
+    parser.add_argument(
+        "--format", "-f",
+        choices=["csv", "json"],
+        default="csv",
+        help="Output format (default: csv)"
+    )
+    
+    parser.add_argument(
+        "--delay", "-d",
+        type=float,
+        default=1.5,
+        help="Delay between requests in seconds (default: 1.5 fast mode, use 3.0+ if getting blocked)"
+    )
+    
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="Use HTTP requests instead of browser mode (browser mode is default)"
+    )
+    
+    parser.add_argument(
+        "--visible",
+        action="store_true",
+        help="Show browser window when using browser mode"
+    )
+
+    # Indeed has been deprecated and removed.
+    
+    parser.add_argument(
+        "--fetch-details",
+        action="store_true",
+        help="Fetch full job descriptions from each job page (slower but more complete)"
+    )
+    
+    parser.add_argument(
+        "--max-details",
+        type=int,
+        default=None,
+        help="Maximum number of job details to fetch (default: all jobs)"
+    )
+    
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=10,
+        help="Number of parallel browser workers for fetching job details (default: 10, optimal for 6-core/12-thread CPU)"
+    )
+    
+    parser.add_argument(
+        "--sequential",
+        action="store_true",
+        help="Fetch job details sequentially instead of in parallel (slower but uses less resources)"
+    )
+    
+    args = parser.parse_args()
+
+    # If any scrape-specific flags are provided, skip menu and go straight to scrape
+    has_non_default_scrape_flags = any([
+        args.http,
+        args.output is not None,
+        args.pages != 3,
+        args.source != "all",
+        args.format != "csv",
+    ])
+
+    if not has_non_default_scrape_flags:
+        choice = choose_main_action()
+        if choice == "2":
+            analyze_ui()
+            return
+        elif choice == "3":
+            return
+        # else: "1" -> continue into scrape flow below
+
+    # Load URL skip-store so we don't re-process jobs across runs
+    seen_urls = load_seen_urls()
+
+    # Get search parameters interactively
+    keywords, location, pages, use_fuzzy = get_search_parameters()
+
+    # Expand search terms if fuzzy search enabled
+    if use_fuzzy:
+        search_terms = expand_search_terms(keywords)
+    else:
+        search_terms = [keywords]
+
+    # Create job collection with search context
+    collection = JobCollection()
+    collection.set_search_params(keywords, location)
+    
+    print(f"\n{'='*60}")
+    print(f"Job Scraper - Searching for '{keywords}' in '{location}'")
+    if use_fuzzy and len(search_terms) > 1:
+        print(f"Fuzzy search enabled: {len(search_terms)} search variants")
+    print(f"Max pages per search: {pages}")
+    if args.http:
+        print("Mode: HTTP requests")
+    else:
+        print("Mode: Browser-based (Selenium)")
+    print(f"{'='*60}\n")
+    
+    # Use browser-based scraping by default, HTTP only when --http is specified
+    scraper = None
+    if not args.http:
+        try:
+            from browser_scraper import BrowserScraper
+            scraper = BrowserScraper(
+                headless=not args.visible,
+                delay=args.delay,
+            )
+            
+            # Run searches for all search terms
+            for i, search_term in enumerate(search_terms, 1):
+                if len(search_terms) > 1:
+                    print(f"\n[{i}/{len(search_terms)}] Searching: '{search_term}'")
+                
+                if args.source == "all":
+                    jobs = scraper.scrape_all(search_term, location, pages)
+                    collection.add_all(jobs)
+                elif args.source == "seek":
+                    jobs = scraper.scrape_seek(search_term, location, pages)
+                    collection.add_all(jobs)
+                else:
+                    jobs = scraper.scrape_jora(search_term, location, pages)
+                    collection.add_all(jobs)
+            
+            # Filter out already-seen URLs BEFORE fetching details
+            if len(collection) > 0:
+                original_count = len(collection)
+                collection.jobs = [job for job in collection.jobs if job.url and job.url not in seen_urls]
+                skipped_count = original_count - len(collection)
+                if skipped_count > 0:
+                    print(f"Skipping {skipped_count} jobs already seen in previous runs")
+            
+            # Deduplicate within collection (fuzzy search may return same jobs)
+            if len(search_terms) > 1 and len(collection) > 0:
+                seen_in_collection = set()
+                unique_jobs = []
+                for job in collection.jobs:
+                    if job.url and job.url not in seen_in_collection:
+                        seen_in_collection.add(job.url)
+                        unique_jobs.append(job)
+                duplicates_removed = len(collection) - len(unique_jobs)
+                if duplicates_removed > 0:
+                    print(f"Removed {duplicates_removed} duplicate jobs from fuzzy search")
+                collection.jobs = unique_jobs
+            
+            # Always fetch full job descriptions in browser mode
+            if len(collection) > 0:
+                if args.sequential:
+                    scraper.fetch_job_details_sequential(collection.jobs, max_jobs=args.max_details)
+                else:
+                    scraper.fetch_job_details(collection.jobs, max_jobs=args.max_details, workers=args.workers)
+            
+            scraper.close()
+            scraper = None
+            
+        except ImportError:
+            print("Error: Browser scraping requires selenium and webdriver-manager")
+            print("Install with: pip install selenium webdriver-manager")
+            print("Falling back to HTTP mode...")
+            args.http = True  # Force HTTP mode
+        except Exception as e:
+            print(f"Error during browser scraping: {e}")
+            print("Falling back to HTTP mode...")
+            args.http = True  # Force HTTP mode
+            if scraper:
+                scraper.close()
+    
+    # Use HTTP-based scraping if --http flag or browser mode failed
+    if args.http:
+        for i, search_term in enumerate(search_terms, 1):
+            if len(search_terms) > 1:
+                print(f"\n[{i}/{len(search_terms)}] Searching: '{search_term}'")
+            
+            # Scrape Seek
+            if args.source in ["all", "seek"]:
+                try:
+                    seek_scraper = SeekScraper(delay=args.delay)
+                    seek_jobs = seek_scraper.scrape(search_term, location, max_pages=pages)
+                    collection.add_all(seek_jobs)
+                except Exception as e:
+                    print(f"Error scraping Seek: {e}")
+
+            if args.source in ["jora"]:
+                print("\nNote: Jora scraping is supported only in browser mode. Re-run without --http.")
+    
+    print(f"\n{'='*60}")
+    print(f"Total jobs found: {len(collection)}")
+    print(f"{'='*60}\n")
+    
+    # Filter out jobs whose URLs we've already seen (for HTTP mode - browser mode filters earlier)
+    if args.http and len(collection) > 0:
+        original_count = len(collection)
+        collection.jobs = [job for job in collection.jobs if job.url and job.url not in seen_urls]
+        skipped_count = original_count - len(collection)
+        if skipped_count > 0:
+            print(f"Skipping {skipped_count} jobs already seen in previous runs")
+
+    # Export results
+    if len(collection) > 0:
+        # Persist URLs so future runs can skip already-seen jobs
+        try:
+            add_urls(job.url for job in collection.jobs if job.url)
+        except Exception:
+            # Fail soft: scraping results should still be saved even if skip-store write fails
+            pass
+
+        # Create run folder and save individual job files
+        run_folder = collection.create_run_folder("scraped_data")
+        collection.save_all_jobs()
+        
+        # Save combined CSV/JSON in the run folder
+        if args.format == "csv":
+            collection.to_csv()
+        else:
+            collection.to_json()
+        
+        # Always create compiled text file for AI analysis
+        collection.to_compiled_text()
+        collection.to_markdown()
+        
+        print(f"\n📁 All data saved to: {run_folder}")
+        print(f"   📄 compiled_jobs.txt - Plain text for AI analysis")
+        print(f"   📄 compiled_jobs.md  - Markdown format")
+        print(f"   📄 all_jobs.{args.format}   - Structured data")
+        print(f"   📂 jobs/            - Individual job files")
+        
+        # Run requirements analysis
+        print("\n" + "=" * 60)
+        print("Analyzing job requirements...")
+        print("=" * 60)
+        
+        try:
+            from analyze_requirements import JobRequirementsAnalyzer
+            import os
+            
+            compiled_file = os.path.join(run_folder, "compiled_jobs.md")
+            if os.path.exists(compiled_file):
+                analyzer = JobRequirementsAnalyzer()
+                jobs_data = analyzer.extract_jobs_from_markdown(compiled_file)
+                analysis = analyzer.analyze_all_jobs(jobs_data)
+                report = analyzer.generate_report(analysis, run_folder)
+                print(report)
+        except Exception as e:
+            print(f"Note: Could not run requirements analysis: {e}")
+        
+        # Print summary
+        print("\nSample of jobs found:")
+        print("-" * 60)
+        for job in list(collection)[:5]:
+            print(f"\n📋 {job.title}")
+            print(f"   🏢 {job.company}")
+            print(f"   📍 {job.location}")
+            if job.salary:
+                print(f"   💰 {job.salary}")
+            print(f"   🔗 {job.url[:70]}...")
+    else:
+        print("No jobs found. Try different search terms or check your internet connection.")
+        print("\nIf you're getting 403 Forbidden errors, try:")
+        print("  - Increasing the delay: python main.py --delay 8.0")
+        print("  - Using a VPN")
+        print("  - Using HTTP mode: python main.py --http")
+
+
+if __name__ == "__main__":
+    main()
