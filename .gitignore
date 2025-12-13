@@ -39,6 +39,11 @@ Thumbs.db
 # Selenium / browser profiles (persistent user-data-dir)
 .browser_profiles/
 
+# Local state and generated outputs (kept out of repo root)
+state/
+outputs/
+logs/
+
 # Scrape outputs (runs, compiled reports, job text dumps)
 scraped_data/
 

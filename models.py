@@ -19,6 +19,7 @@ class Job:
     url: str
     source: str  # 'seek' or 'jora'
     full_description: Optional[str] = None  # Full job description from detail page
+    date_posted: Optional[str] = None  # Date the job was posted (e.g., "2d ago", "30d+ ago")
 
     def to_dict(self) -> dict:
         """Convert job to dictionary."""
@@ -40,6 +41,7 @@ class Job:
             f.write(f"Company: {self.company}\n")
             f.write(f"Location: {self.location}\n")
             f.write(f"Salary: {self.salary or 'Not specified'}\n")
+            f.write(f"Posted: {self.date_posted or 'Not specified'}\n")
             f.write(f"Source: {self.source}\n")
             f.write(f"URL: {self.url}\n")
             f.write(f"\n{'='*60}\n")

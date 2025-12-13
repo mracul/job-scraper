@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Iterable, Set
 
-DEFAULT_STORE_PATH = Path(__file__).parent / "seen_urls.json"
+DEFAULT_STORE_PATH = Path(__file__).parent / "state" / "seen_urls.json"
 
 
 def load_seen_urls(path: os.PathLike | str | None = None) -> Set[str]:

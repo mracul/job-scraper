@@ -238,8 +238,9 @@ def analyze_ui():
     
     print(f"\nAnalyzing {len(all_jobs)} jobs from {len(selected_runs)} run(s)...")
     analysis = analyzer.analyze_all_jobs(all_jobs)
-    # Save a combined report at repo root
-    output_dir = Path(".")
+    # Save a combined report under outputs/ (keep repo root clean)
+    output_dir = Path("outputs")
+    output_dir.mkdir(parents=True, exist_ok=True)
     report = analyzer.generate_report(analysis, str(output_dir))
     print(report)
 
@@ -256,6 +257,32 @@ Examples:
     python main.py --http                    # Use HTTP mode instead
     python main.py --source seek --format json
         """
+    )
+
+    parser.add_argument(
+        "--keywords",
+        type=str,
+        default=None,
+        help="Search keywords/job title (non-interactive). If omitted, prompts interactively."
+    )
+
+    parser.add_argument(
+        "--location",
+        type=str,
+        default=None,
+        help="Search location (non-interactive). If omitted, prompts interactively."
+    )
+
+    fuzzy_group = parser.add_mutually_exclusive_group()
+    fuzzy_group.add_argument(
+        "--fuzzy",
+        action="store_true",
+        help="Expand search with related terms (non-interactive)."
+    )
+    fuzzy_group.add_argument(
+        "--no-fuzzy",
+        action="store_true",
+        help="Disable fuzzy search expansion (non-interactive)."
     )
     
     parser.add_argument(
@@ -333,6 +360,15 @@ Examples:
     
     args = parser.parse_args()
 
+    # Normalize fuzzy flag into a tri-state: None=interactive prompt, True/False=forced
+    forced_fuzzy: bool | None
+    if args.fuzzy:
+        forced_fuzzy = True
+    elif args.no_fuzzy:
+        forced_fuzzy = False
+    else:
+        forced_fuzzy = None
+
     # If any scrape-specific flags are provided, skip menu and go straight to scrape
     has_non_default_scrape_flags = any([
         args.http,
@@ -340,6 +376,9 @@ Examples:
         args.pages != 3,
         args.source != "all",
         args.format != "csv",
+        args.keywords is not None,
+        args.location is not None,
+        forced_fuzzy is not None,
     ])
 
     if not has_non_default_scrape_flags:
@@ -354,8 +393,14 @@ Examples:
     # Load URL skip-store so we don't re-process jobs across runs
     seen_urls = load_seen_urls()
 
-    # Get search parameters interactively
-    keywords, location, pages, use_fuzzy = get_search_parameters()
+    # Get search parameters (non-interactive when provided)
+    if args.keywords is not None or args.location is not None or forced_fuzzy is not None:
+        keywords = (args.keywords or "").strip() or DEFAULT_KEYWORDS
+        location = (args.location or "").strip() or DEFAULT_LOCATION
+        pages = int(args.pages)
+        use_fuzzy = bool(forced_fuzzy) if forced_fuzzy is not None else False
+    else:
+        keywords, location, pages, use_fuzzy = get_search_parameters()
 
     # Expand search terms if fuzzy search enabled
     if use_fuzzy:
@@ -386,6 +431,7 @@ Examples:
             scraper = BrowserScraper(
                 headless=not args.visible,
                 delay=args.delay,
+                browser="chrome",
             )
             
             # Run searches for all search terms

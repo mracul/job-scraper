@@ -159,6 +159,16 @@ job-scraper/
 └── README.md                # This file
 ```
 
+## Streamlit UI
+
+If you prefer a visual interface, use the helper script that runs the dashboard where you can start new runs, review reports, and adjust settings.
+
+```bash
+run_streamlit.bat
+```
+
+This simply executes `streamlit run streamlit_app.py` with the right working directory.
+
 ## License
 
 MIT License - Use at your own risk.

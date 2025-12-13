@@ -11,7 +11,7 @@ from selenium.webdriver.edge.service import Service as EdgeService
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
 from threading import Lock
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin, urlparse, parse_qs, urlunparse
 import time
 import random
 from models import Job
@@ -30,7 +30,7 @@ class BrowserScraper:
         self,
         headless: bool = True,
         delay: float = 1.5,
-        browser: str = "auto",
+        browser: str = "chrome",
     ):
         """
         Initialize the browser scraper.
@@ -38,7 +38,7 @@ class BrowserScraper:
         Args:
             headless: Run browser in headless mode (set False to see browser)
             delay: Delay between actions (default 1.5s for fast mode)
-            browser: Browser to use: "chrome", "edge", or "auto" (try both)
+            browser: Browser to use: "chrome" or "edge". Default is "chrome".
         """
         self.headless = headless
         self.delay = delay
@@ -53,10 +53,11 @@ class BrowserScraper:
         if self.driver:
             return  # Already set up
         
-        # Try Chrome first, then Edge
+        # Prefer Chrome. Do not implicitly fall back to Edge because a system
+        # msedgedriver in PATH can be incompatible with the installed Edge.
         browsers_to_try = []
         if self.browser == "auto":
-            browsers_to_try = ["chrome", "edge"]  # Chrome is more reliable
+            browsers_to_try = ["chrome"]
         else:
             browsers_to_try = [self.browser]
         
@@ -116,10 +117,14 @@ class BrowserScraper:
         """Configure browser options for anti-detection."""
         if self.headless:
             options.add_argument('--headless=new')
+            # Headless-specific stability options
+            options.add_argument('--disable-gpu')
+            options.add_argument('--remote-debugging-port=0')
 
         # Persist a real browser profile to reduce repeated bot checks.
         # IMPORTANT: do not share profiles across parallel worker drivers.
-        if use_profile and self.profile_dir:
+        # IMPORTANT: profile persistence can cause crashes in headless mode, so skip it.
+        if use_profile and self.profile_dir and not self.headless:
             try:
                 from pathlib import Path
 
@@ -138,7 +143,7 @@ class BrowserScraper:
         options.add_experimental_option('useAutomationExtension', False)
 
         # Viewport
-        if use_profile and self.profile_dir:
+        if use_profile and self.profile_dir and not self.headless:
             # Keep stable fingerprint with persisted profile.
             options.add_argument('--window-size=1600,1000')
         else:
@@ -152,7 +157,7 @@ class BrowserScraper:
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0'
         ]
-        if use_profile and self.profile_dir:
+        if use_profile and self.profile_dir and not self.headless:
             # Cloudflare clearance cookies can be tied to a fingerprint; keep UA stable for a reused profile.
             options.add_argument(f'--user-agent={user_agents[0]}')
         else:
@@ -515,6 +520,17 @@ class BrowserScraper:
                 except NoSuchElementException:
                     continue
 
+            # Find listing date (e.g., "2d ago", "30d+ ago")
+            date_posted = None
+            for selector in ["[data-automation='jobListingDate']", "[data-testid='listing-date']", "span[data-automation='jobListingDate']", "time", ".listing-date"]:
+                try:
+                    date_elem = card.find_element(By.CSS_SELECTOR, selector)
+                    date_posted = date_elem.text.strip()
+                    if date_posted:
+                        break
+                except NoSuchElementException:
+                    continue
+
             if not title:
                 return None
                 
@@ -525,7 +541,8 @@ class BrowserScraper:
                 salary=salary,
                 description=description,
                 url=url,
-                source="seek"
+                source="seek",
+                date_posted=date_posted
             )
 
         except Exception as e:
@@ -762,6 +779,24 @@ class BrowserScraper:
                 except Exception:
                     continue
 
+            # Date posted (best-effort)
+            date_posted = None
+            for selector in [
+                "[class*='date']",
+                "[data-testid*='date']",
+                "time",
+                "[class*='posted']",
+                "[class*='listing-date']",
+            ]:
+                try:
+                    elem = card.find_element(By.CSS_SELECTOR, selector)
+                    txt = (elem.text or "").strip()
+                    if txt:
+                        date_posted = txt
+                        break
+                except Exception:
+                    continue
+
             return Job(
                 title=title,
                 company=company,
@@ -770,29 +805,125 @@ class BrowserScraper:
                 description=description,
                 url=url,
                 source="jora",
+                date_posted=date_posted,
             )
         except Exception:
             return None
 
     def _find_jora_next_page_url(self) -> str | None:
         """Attempt to discover a stable next-page URL on Jora."""
-        for selector in [
-            "a[rel='next']",
-            "a[aria-label*='Next']",
-            "a[title*='Next']",
-            "a[href*='page=']",
-            "a[href*='p=']",
-        ]:
+        def _normalize_candidate_href(href: str) -> str | None:
+            href = (href or "").strip()
+            if not href:
+                return None
+            lowered = href.lower()
+            if lowered.startswith("javascript:") or lowered.startswith("#"):
+                return None
+
+            current_url = getattr(self.driver, "current_url", None)
+            if href.startswith("?") and current_url:
+                try:
+                    parsed_current = urlparse(current_url)
+                    current_qs = parse_qs(parsed_current.query, keep_blank_values=True)
+                    update_qs = parse_qs(href[1:], keep_blank_values=True)
+                    current_qs.update(update_qs)
+                    merged_query = urlencode(current_qs, doseq=True)
+                    merged = parsed_current._replace(query=merged_query, fragment="")
+                    return urlunparse(merged)
+                except Exception:
+                    pass
+
+            base = getattr(self.driver, "current_url", None) or "https://au.jora.com/"
+            try:
+                joined = urljoin(base, href)
+                parsed_joined = urlparse(joined)
+                joined = urlunparse(parsed_joined._replace(fragment=""))
+                if joined.startswith("http://") or joined.startswith("https://"):
+                    return joined
+            except Exception:
+                return None
+            return None
+
+        def _extract_page_number(url: str) -> int | None:
+            try:
+                qs = parse_qs(urlparse(url).query)
+                for key in ("page", "p"):
+                    raw = (qs.get(key) or [None])[0]
+                    if raw is None:
+                        continue
+                    return int(raw)
+            except Exception:
+                return None
+            return None
+
+        def _iter_elements(selector: str):
+            if not self.driver:
+                return []
+            try:
+                if hasattr(self.driver, "find_elements"):
+                    return self.driver.find_elements(By.CSS_SELECTOR, selector) or []
+            except Exception:
+                pass
             try:
                 elem = self.driver.find_element(By.CSS_SELECTOR, selector)
-                href = (elem.get_attribute("href") or "").strip()
-                if href:
-                    if href.startswith("/"):
-                        return "https://au.jora.com" + href
-                    return href
+                return [elem] if elem else []
             except Exception:
+                return []
+
+        current_url = getattr(self.driver, "current_url", None) or ""
+        current_url_norm = _normalize_candidate_href(current_url) or current_url
+        current_page = _extract_page_number(current_url_norm) or 1
+
+        # Highest-confidence selectors first.
+        for selector in ("a[rel='next']", "a[aria-label*='Next']", "a[title*='Next']"):
+            for elem in _iter_elements(selector):
+                try:
+                    href = elem.get_attribute("href")
+                except Exception:
+                    href = None
+                normalized = _normalize_candidate_href(href or "")
+                if normalized and normalized != current_url_norm:
+                    return normalized
+
+        # Fallback: collect pagination-like links and choose the smallest page > current.
+        candidates: list[str] = []
+        for selector in ("a[href*='page=']", "a[href*='p=']"):
+            for elem in _iter_elements(selector):
+                try:
+                    href = elem.get_attribute("href")
+                except Exception:
+                    href = None
+                normalized = _normalize_candidate_href(href or "")
+                if not normalized:
+                    continue
+                if normalized == current_url_norm:
+                    continue
+                candidates.append(normalized)
+
+        if not candidates:
+            return None
+
+        unique_candidates: list[str] = []
+        seen = set()
+        for c in candidates:
+            if c in seen:
                 continue
-        return None
+            seen.add(c)
+            unique_candidates.append(c)
+
+        best_url: str | None = None
+        best_page: int | None = None
+        for c in unique_candidates:
+            page_num = _extract_page_number(c)
+            if page_num is None:
+                continue
+            if page_num <= current_page:
+                continue
+            if best_page is None or page_num < best_page:
+                best_page = page_num
+                best_url = c
+
+        return best_url or unique_candidates[0]
 
     def close(self):
         """Close the browser."""
