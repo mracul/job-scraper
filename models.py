@@ -158,6 +158,57 @@ class JobCollection:
             json.dump([job.to_dict() for job in self.jobs], f, indent=2)
         print(f"Exported {len(self.jobs)} jobs to {filename}")
 
+    def to_jsonl(self, filename: str = None, *, bundle_metadata: dict | None = None) -> str:
+        """Export jobs to JSONL (one JSON object per line).
+
+        First line is an optional `_meta` object to support analyzers.
+        """
+        if not self.jobs:
+            print("No jobs to export.")
+            return ""
+
+        # If run_folder exists, save there
+        if self.run_folder and not filename:
+            filename = os.path.join(self.run_folder, "jobs.jsonl")
+        elif not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"jobs_{timestamp}.jsonl"
+
+        def _extract_source_id(source: str, url: str) -> str | None:
+            raw = (url or "").strip()
+            if not raw:
+                return None
+            if (source or "").strip().lower() == "seek":
+                m = re.search(r"\\bjobid=(\\d+)\\b", raw, re.IGNORECASE)
+                if m:
+                    return m.group(1)
+                url2 = raw.split("#", 1)[0].split("?", 1)[0]
+                m = re.search(r"/job/(\\d+)\\b", url2)
+                if m:
+                    return m.group(1)
+            return None
+
+        scraped_at = datetime.now().isoformat(timespec="seconds")
+        meta = {
+            "generated": scraped_at,
+            "keywords": self.search_keywords,
+            "location": self.search_location,
+        }
+        if bundle_metadata:
+            meta.update(bundle_metadata)
+
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"_meta": meta}, ensure_ascii=False) + "\n")
+            for job in self.jobs:
+                obj = job.to_dict()
+                obj["description"] = job.full_description or job.description or ""
+                obj["scraped_at"] = scraped_at
+                obj["source_id"] = obj.get("source_id") or _extract_source_id(obj.get("source"), obj.get("url"))
+                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+        print(f"Exported {len(self.jobs)} jobs to {filename}")
+        return filename
+
     def to_compiled_text(self, filename: str = None) -> str:
         """Export all jobs to a single compiled text file for AI analysis."""
         if not self.jobs:

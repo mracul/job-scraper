@@ -12,7 +12,7 @@ def test_training_provided_detection_in_benefits():
     """
 
     result = analyzer.analyze_job(text)
-    benefits = set(result.get("benefits", []))
+    benefits = set(result['presence'].get("benefits", []))
 
     assert "Training Provided" in benefits
     assert "Mentoring/Coaching" in benefits

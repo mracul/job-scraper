@@ -14,6 +14,7 @@ import subprocess
 import sys
 import shutil
 import hashlib
+import copy
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -63,6 +64,39 @@ DEFAULT_SETTINGS = {
     },
     "ai": {
         "model": "gpt-5-mini"
+    },
+    "bundles": {
+        "1️⃣ Core Entry-Level Catch-All (Daily)": [
+            "IT Support",
+            "Help Desk",
+            "Service Desk",
+        ],
+        "2️⃣ Analyst / Corporate Titles (Daily)": [
+            "Service Desk Analyst",
+            "IT Support Analyst",
+            "ICT Support",
+        ],
+        "3️⃣ Explicit Entry / Junior Signal (Daily)": [
+            "Entry Level IT",
+            "Junior IT",
+            "Level 1 IT",
+            "L1 Support",
+        ],
+        "4️⃣ Desktop / End-User Support (Every 2–3 Days)": [
+            "Desktop Support",
+            "End User Support",
+            "Technical Support",
+        ],
+        "5️⃣ L1–L2 Hybrid / Stretch Roles (Every 2–3 Days)": [
+            "Level 1/2 IT",
+            "Level 2 IT",
+            "Systems Support",
+        ],
+        "6️⃣ Microsoft Stack Signal (Weekly)": [
+            "Microsoft 365 Support",
+            "Active Directory Support",
+            "Azure Support",
+        ],
     }
 }
 
@@ -170,14 +204,23 @@ def _build_ai_summary_input(
 
 AI_SUMMARY_SYSTEM_PROMPT = """You are a career coach helping people enter or progress in IT support and help desk roles, using aggregated job market data to guide efficient decision-making.
 
-You will be given aggregated tag percentages derived from job listings. Your task is to analyze these signals and translate them into practical guidance on where a candidate should focus their effort.
+You will be given a plain-text requirements analysis report generated from job listings (it includes categories, tags, counts, and percentages), plus a small metadata JSON block (search terms/location/run scope).
+
+Your task is to interpret the report and translate it into practical, market-aligned guidance on where a candidate should focus their effort.
 
 Core Principles
 
 - Base your analysis only on the provided data. Do not introduce technologies, certifications, or requirements that do not appear in the tags.
+- Do not infer hidden requirements or “typical” expectations unless they are directly supported by the data.
 - Use percentages to explain relative demand and priority, not to dump data.
 - Focus on patterns, trade-offs, and implications, not exhaustive lists.
 - Be realistic and encouraging; avoid claiming certainty.
+
+Output Discipline  ⬅️ (NEW)
+
+- Prefer depth over breadth: identify the **top 3–5 strongest signals** and deprioritize weaker ones.
+- Avoid repeating the same implication across sections.
+- Do not produce multi-phase roadmaps unless explicitly requested.
 
 Output Expectations
 
@@ -197,11 +240,12 @@ Certifications & Credentials
 
 - Which certifications stand out by demand.
 - How a candidate might sensibly prioritize them (e.g., first vs later), based on relative frequency and role fit.
+- Treat certifications as *signals to employers*, not guarantees of skill.
 
 Technical Skill Focus
 
 - Which technical skills/tools appear most often.
-- What those signals imply about what to practice, lab, or demonstrate.
+- What those signals imply about the **types of problems a support role is expected to solve**. ⬅️ (NEW)
 
 Professional & Soft Skills
 
@@ -210,13 +254,13 @@ Professional & Soft Skills
 
 Practical Development Guidance
 
-Translate the data into concrete next steps:
+Translate the data into **concrete but bounded** next steps:
 
-- learning focus
-- practice or lab ideas
-- signals to target in resumes or interviews
+- What to prioritize learning or practicing first
+- What kinds of hands-on evidence would best align with the strongest signals
+- What to emphasise in resumes or interviews
 
-Experience level and work arrangement signals should be woven naturally into the analysis where they add context, rather than treated as standalone topics.
+Avoid long-term career planning or speculative pathways unless directly supported by the data. ⬅️ (NEW)
 
 Search Context
 
@@ -249,11 +293,22 @@ def _generate_ai_summary_text(ai_input: dict) -> str:
     settings = load_settings()
     ai_model = settings.get("ai", {}).get("model", "gpt-5-mini")
 
-    user_prompt = (
-        "Here is aggregated job-requirement data (counts and consolidated percentages) for the user's search. "
-        "Use it to produce the requested summary.\n\n"
-        f"DATA_JSON={_stable_json_dumps(ai_input)}"
-    )
+    # Prefer sending the human-readable analysis text (requirements_analysis.txt) plus metadata.
+    # Backward-compatibility: some callers still pass structured JSON (categories/top terms).
+    if isinstance(ai_input, dict) and isinstance(ai_input.get("analysis_text"), str):
+        meta = ai_input.get("meta")
+        user_prompt = (
+            "Here is a job requirements analysis report for the user's search. "
+            "Use ONLY the report text and the metadata block to produce the requested summary.\n\n"
+            f"METADATA_JSON={_stable_json_dumps(meta if isinstance(meta, dict) else {})}\n\n"
+            f"REQUIREMENTS_ANALYSIS_TXT=\n{ai_input.get('analysis_text','').strip()}"
+        )
+    else:
+        user_prompt = (
+            "Here is aggregated job-requirement data (counts and consolidated percentages) for the user's search. "
+            "Use it to produce the requested summary.\n\n"
+            f"DATA_JSON={_stable_json_dumps(ai_input)}"
+        )
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
@@ -275,7 +330,7 @@ def _generate_ai_summary_text(ai_input: dict) -> str:
                 url,
                 headers=headers,
                 json=payload,
-                timeout=60,
+                timeout=120,
             )
         except requests.RequestException as exc:
             last_error = exc
@@ -336,11 +391,24 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
 
     auto_key = f"ai_auto_{cache_path.name}_{input_hash[:8]}"
     inflight_key = f"ai_inflight_{cache_path.name}_{input_hash[:8]}"
+    inflight_started_key = f"ai_inflight_started_{cache_path.name}_{input_hash[:8]}"
     summary_text = cached_text
+
+    # If a previous run was interrupted (browser refresh, navigation, kernel reset),
+    # the UI can get stuck in an "inflight" state. Auto-clear after a grace period.
+    try:
+        inflight_started = st.session_state.get(inflight_started_key)
+        if st.session_state.get(inflight_key) and isinstance(inflight_started, (int, float)):
+            if (time.time() - float(inflight_started)) > 300:
+                st.session_state[inflight_key] = False
+                st.session_state.pop(inflight_started_key, None)
+    except Exception:
+        pass
 
     if auto_generate and (not summary_text) and (not st.session_state.get(auto_key)):
         st.session_state[auto_key] = True
         st.session_state[inflight_key] = True
+        st.session_state[inflight_started_key] = time.time()
         try:
             with st.spinner("Auto-generating AI summary..."):
                 summary_text = _generate_ai_summary_text(ai_input)
@@ -356,10 +424,12 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
                 },
             )
             st.session_state[inflight_key] = False
+            st.session_state.pop(inflight_started_key, None)
             st.rerun()
             return
         except Exception as exc:
             st.session_state[inflight_key] = False
+            st.session_state.pop(inflight_started_key, None)
             st.error(str(exc))
             summary_text = None
 
@@ -377,11 +447,22 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
     with col1:
         label = "Regenerate" if summary_text else "Generate"
         if st.session_state.get(inflight_key):
-            st.spinner("Generating summary...")
+            st.info("Generating summary…")
+            if st.button(
+                "Reset",
+                use_container_width=True,
+                key=f"reset_{cache_path.name}_{input_hash[:8]}",
+                help="Clears a stuck in-progress state so you can generate again.",
+            ):
+                st.session_state[inflight_key] = False
+                st.session_state.pop(inflight_started_key, None)
+                st.session_state[auto_key] = False
+                st.rerun()
         else:
             if st.button(f"✨ {label} summary", use_container_width=True, key=f"gen_{cache_path.name}_{input_hash[:8]}"):
                 st.session_state[auto_key] = False
                 st.session_state[inflight_key] = True
+                st.session_state[inflight_started_key] = time.time()
                 try:
                     with st.spinner("Generating summary..."):
                         summary_text = _generate_ai_summary_text(ai_input)
@@ -397,10 +478,12 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
                         },
                     )
                     st.session_state[inflight_key] = False
+                    st.session_state.pop(inflight_started_key, None)
                     st.rerun()
                     return
                 except Exception as e:
                     st.session_state[inflight_key] = False
+                    st.session_state.pop(inflight_started_key, None)
                     st.error(str(e))
     with col2:
         if cached_text and st.button("🧹 Clear", use_container_width=True, key=f"clr_{cache_path.name}_{input_hash[:8]}"):
@@ -433,14 +516,15 @@ def load_settings() -> dict:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             # Merge with defaults to ensure all keys exist
-            settings = DEFAULT_SETTINGS.copy()
-            for section in ["scraper", "ui", "ai"]:
+            settings = copy.deepcopy(DEFAULT_SETTINGS)
+            for section in ["scraper", "ui", "ai", "bundles"]:
                 if section in saved:
-                    settings[section].update(saved[section])
+                    if isinstance(settings.get(section), dict) and isinstance(saved.get(section), dict):
+                        settings[section].update(saved[section])
             return settings
         except Exception:
             pass
-    return DEFAULT_SETTINGS.copy()
+    return copy.deepcopy(DEFAULT_SETTINGS)
 
 
 def save_settings(settings: dict) -> None:
@@ -640,6 +724,48 @@ def load_analysis(run_path: Path) -> dict | None:
     except Exception:
         mtime = 0.0
     return _load_analysis_cached(str(analysis_file), mtime)
+
+
+@st.cache_data
+def _load_text_file_cached(path: str, mtime: float) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def load_requirements_analysis_txt(run_path: Path) -> str | None:
+    """Load requirements_analysis.txt for a run (human-readable analysis)."""
+    txt_file = run_path / "requirements_analysis.txt"
+    if not txt_file.exists():
+        return None
+    try:
+        mtime = float(txt_file.stat().st_mtime)
+    except Exception:
+        mtime = 0.0
+    return _load_text_file_cached(str(txt_file), mtime)
+
+
+def _truncate_text(text: str, *, max_chars: int, suffix: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - len(suffix)] + suffix
+
+
+def _build_ai_text_payload(*, analysis_text: str, meta: dict) -> dict:
+    """Build the AI input payload for summary generation.
+
+    The report text is the authoritative representation of the categorical data.
+    """
+    return {
+        "analysis_text": str(analysis_text or ""),
+        "meta": meta if isinstance(meta, dict) else {},
+    }
 
 
 @st.cache_data
@@ -1224,7 +1350,6 @@ def _normalize_navigation_state() -> None:
         st.session_state.selected_filters = {}
         st.session_state.filter_mode = "any"
         st.session_state.search_text = ""
-        _clear_report_filter_widgets()
         return
 
     # Reports page: validate view_mode.
@@ -1270,8 +1395,7 @@ def navigate_to(page: str, **kwargs):
     for key, value in kwargs.items():
         st.session_state[key] = value
 
-    # If the run changes (or filters are explicitly set), clear explorer widget state
-    # so widgets don't retain invalid selections across runs.
+    # If the run changes, clear filter state so widgets don't retain invalid selections across runs.
     if "selected_run" in kwargs and kwargs.get("selected_run") != prev_selected_run:
         if "selected_filters" not in kwargs:
             st.session_state.selected_filters = {}
@@ -1286,9 +1410,6 @@ def navigate_to(page: str, **kwargs):
 
     _normalize_navigation_state()
     _sync_url_with_state()
-
-
- 
 
 
 # ============================================================================
@@ -1480,24 +1601,6 @@ HALFLIFE_LABELS = [label for label, _ in HALFLIFE_PRESETS]
 HALFLIFE_VALUES = {label: value for label, value in HALFLIFE_PRESETS}
 
 
-def _compute_delta_vs_prev(series: list[dict], cat_key: str, term: str) -> str | None:
-    """Compute delta (pp) between latest and previous run for a term."""
-    cat_rows = [r for r in series if r.get("category") == cat_key and r.get("term") == term]
-    if len(cat_rows) < 2:
-        return None
-    # Sort by run_order (or timestamp) descending
-    cat_rows_sorted = sorted(cat_rows, key=lambda x: x.get("run_order", 0), reverse=True)
-    latest_pct = cat_rows_sorted[0].get("pct", 0)
-    prev_pct = cat_rows_sorted[1].get("pct", 0)
-    delta = latest_pct - prev_pct
-    if abs(delta) < 0.5:
-        return "→"
-    elif delta > 0:
-        return f"↑ +{delta:.1f}pp"
-    else:
-        return f"↓ {delta:.1f}pp"
-
-
 def _render_market_context_bars(weighted_summary: dict, effective_jobs: float) -> None:
     """Render market context (support levels + work arrangements) as progress bars."""
     st.subheader("📊 Market Context")
@@ -1528,94 +1631,38 @@ def _render_market_context_bars(weighted_summary: dict, effective_jobs: float) -
             st.caption("No work arrangement data available.")
 
 
-def _render_category_snapshot(cat_key: str, cat_label: str, weighted_summary: dict, top_terms: list[str], series: list[dict]) -> None:
-    """Render a category as a snapshot table with view toggle."""
+def _render_category_snapshot(
+    cat_key: str,
+    cat_label: str,
+    weighted_summary: dict,
+    top_terms: list[str],
+    series: list[dict] | None = None,
+) -> None:
+    """Render a category as a simple snapshot table.
+
+    `series` is accepted for forward-compatibility (some callers pass it) but is
+    not currently used by the table snapshot view.
+    """
     cat_data = weighted_summary.get(cat_key, {})
     if not cat_data or not top_terms:
         return
 
     with st.expander(cat_label, expanded=False):
-        # View toggle
-        view_key = f"view_mode_{cat_key}"
-        if view_key not in st.session_state:
-            st.session_state[view_key] = "Snapshot"
-
-        view_options = ["Snapshot", "Heatmap", "Advanced"]
-        cols = st.columns([1, 1, 1, 3])
-        for i, opt in enumerate(view_options):
-            with cols[i]:
-                if st.button(opt, key=f"{cat_key}_{opt}", use_container_width=True,
-                           type="primary" if st.session_state[view_key] == opt else "secondary"):
-                    st.session_state[view_key] = opt
-                    st.rerun()
-
-        view_mode = st.session_state[view_key]
-
-        if view_mode == "Snapshot":
-            # Snapshot table
-            table_data = []
-            for term in top_terms:
-                item = cat_data.get(term, {})
-                w_pct = item.get("weighted_pct", 0)
-                w_count = item.get("weighted_count", 0)
-                delta = _compute_delta_vs_prev(series, cat_key, term)
-                table_data.append({
+        table_data = []
+        for term in top_terms:
+            item = cat_data.get(term, {})
+            w_pct = item.get("weighted_pct", 0)
+            w_count = item.get("weighted_count", 0)
+            table_data.append(
+                {
                     "Term": term,
                     "Weighted %": f"{w_pct:.1f}%",
                     "W.Count": f"{w_count:.1f}",
-                    "Δ vs prev": delta or "—",
-                })
-            df_table = pd.DataFrame(table_data)
-            st.dataframe(df_table, use_container_width=True, hide_index=True)
-            st.caption(f"Top {len(top_terms)} shown by weighted count.")
-
-        elif view_mode == "Heatmap":
-            # Heatmap view using series data
-            cat_series = [r for r in series if r.get("category") == cat_key and r.get("term") in top_terms]
-            if cat_series:
-                df_heat = pd.DataFrame(cat_series)
-                # Pivot: rows=term, cols=run, values=pct
-                try:
-                    pivot = df_heat.pivot(index="term", columns="run", values="pct").fillna(0)
-                    fig = px.imshow(
-                        pivot,
-                        labels=dict(x="Run", y="Term", color="% of jobs"),
-                        aspect="auto",
-                        color_continuous_scale="Blues",
-                    )
-                    fig.update_layout(margin=dict(l=10, r=10, t=20, b=10), height=max(200, len(top_terms) * 25))
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception:
-                    st.info("Unable to render heatmap.")
-            else:
-                st.info("No series data for heatmap.")
-
-        else:  # Advanced (line chart)
-            cat_series = [r for r in series if r.get("category") == cat_key and r.get("term") in top_terms]
-            if cat_series:
-                df_line = pd.DataFrame(cat_series)
-                has_ts = "timestamp" in df_line.columns and df_line["timestamp"].notna().any()
-                x_col = "timestamp" if has_ts else "run_order"
-                try:
-                    df_line = df_line.sort_values(by=[x_col, "term"], ascending=True)
-                except Exception:
-                    pass
-                fig = px.line(
-                    df_line,
-                    x=x_col,
-                    y="pct",
-                    color="term",
-                    markers=True,
-                    labels={"pct": "% of jobs"},
-                )
-                fig.update_layout(
-                    legend_title_text="Term",
-                    margin=dict(l=10, r=10, t=20, b=10),
-                    height=360,
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No series data for chart.")
+                }
+            )
+        df_table = pd.DataFrame(table_data)
+        st.dataframe(df_table, use_container_width=True, hide_index=True)
+        st.caption(f"Top {len(top_terms)} shown by weighted count.")
 
 
 def render_overview_page():
@@ -1805,47 +1852,6 @@ def render_overview_page():
         )
         ai_cache = OVERVIEW_DIR / f"ai_{_hash_payload(params)[:16]}.json"
         _render_ai_summary_block(cache_path=ai_cache, ai_input=ai_input, auto_generate=False)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Explore Changes (Advanced) - collapsed
-    # ─────────────────────────────────────────────────────────────────────────
-    with st.expander("🔍 Explore Changes (Advanced)", expanded=False):
-        st.markdown("**Per-run trend lines** for detailed analysis of term frequency over time.")
-        if not series:
-            st.info("No series data available.")
-        else:
-            df = pd.DataFrame(series)
-            has_ts = "timestamp" in df.columns and df["timestamp"].notna().any()
-            x_col = "timestamp" if has_ts else "run_order"
-
-            for cat_key, cat_label in CATEGORY_LABELS.items():
-                terms = top_terms.get(cat_key) or []
-                if not terms:
-                    continue
-                subset = df[(df["category"] == cat_key) & (df["term"].isin(terms))].copy()
-                if subset.empty:
-                    continue
-
-                st.markdown(f"**{cat_label}**")
-                try:
-                    subset = subset.sort_values(by=[x_col, "term"], ascending=True)
-                except Exception:
-                    pass
-
-                fig = px.line(
-                    subset,
-                    x=x_col,
-                    y="pct",
-                    color="term",
-                    markers=True,
-                    labels={"pct": "% of jobs"},
-                )
-                fig.update_layout(
-                    legend_title_text="Term",
-                    margin=dict(l=10, r=10, t=20, b=10),
-                    height=300,
-                )
-                st.plotly_chart(fig, use_container_width=True)
 
 
 def render_report_list():
@@ -2146,15 +2152,47 @@ def render_compiled_overview():
         kw, loc = _get_run_search_meta(p)
         if kw or loc:
             search_pairs.append({"keywords": kw, "location": loc, "run": p.name})
-    ai_input = _build_ai_summary_input(
-        total_jobs=total_jobs,
-        summary=summary,
-        search_context={
+
+    # Prefer requirements_analysis.txt as the data source for the LLM.
+    # For compiled summaries, concatenate per-run reports with lightweight headers.
+    per_run_blocks: list[str] = []
+    for run_path, analysis in analyses:
+        txt = load_requirements_analysis_txt(run_path) or ""
+        if not txt.strip():
+            continue
+        kw, loc = _get_run_search_meta(run_path)
+        run_total = None
+        try:
+            run_total = int((analysis or {}).get("total_jobs", 0) or 0)
+        except Exception:
+            run_total = None
+        header_lines = [
+            f"RUN: {run_path.name}",
+            f"KEYWORDS: {kw or ''}",
+            f"LOCATION: {loc or ''}",
+        ]
+        if run_total is not None:
+            header_lines.append(f"TOTAL_JOBS: {run_total}")
+        header = "\n".join(header_lines).strip()
+        per_run_blocks.append(f"{header}\n\n{txt.strip()}")
+
+    combined_txt = "\n\n".join(per_run_blocks).strip()
+    combined_txt = _truncate_text(
+        combined_txt,
+        max_chars=120_000,
+        suffix="\n\n[TRUNCATED: combined requirements_analysis.txt exceeded limit]",
+    )
+
+    ai_input = _build_ai_text_payload(
+        analysis_text=combined_txt,
+        meta={
+            "scope": "compiled",
             "runs": [p.name for p in run_paths],
             "search_terms": search_pairs,
+            "total_jobs": int(total_jobs or 0),
+            "companies": int(unique_companies or 0),
+            "compiled_reports": int(len(run_paths)),
         },
-        scope_label="compiled",
-        top_n_per_category=AI_SUMMARY_TOP_N_COMPILED,
     )
     compiled_key = hashlib.sha256("|".join(sorted(p.name for p in run_paths)).encode("utf-8")).hexdigest()[:16]
     cache_path = STATE_DIR / f"compiled_ai_summary_{compiled_key}.json"
@@ -2445,17 +2483,36 @@ def render_report_overview():
 
     # AI summary (single report)
     keywords, location = _get_run_search_meta(run_path)
-    ai_input = _build_ai_summary_input(
-        total_jobs=total_jobs,
-        summary=summary,
-        search_context={
-            "run": run_path.name,
-            "keywords": keywords,
-            "location": location,
-        },
-        scope_label="single",
-        top_n_per_category=AI_SUMMARY_TOP_N_SINGLE,
-    )
+    txt = load_requirements_analysis_txt(run_path)
+    if txt and txt.strip():
+        ai_input = _build_ai_text_payload(
+            analysis_text=_truncate_text(
+                txt.strip(),
+                max_chars=80_000,
+                suffix="\n\n[TRUNCATED: requirements_analysis.txt exceeded limit]",
+            ),
+            meta={
+                "scope": "single",
+                "run": run_path.name,
+                "keywords": keywords,
+                "location": location,
+                "total_jobs": int(total_jobs or 0),
+                "companies": int(unique_companies or 0),
+            },
+        )
+    else:
+        # Fallback for older runs missing requirements_analysis.txt
+        ai_input = _build_ai_summary_input(
+            total_jobs=total_jobs,
+            summary=summary,
+            search_context={
+                "run": run_path.name,
+                "keywords": keywords,
+                "location": location,
+            },
+            scope_label="single",
+            top_n_per_category=AI_SUMMARY_TOP_N_SINGLE,
+        )
     cache_path = run_path / "ai_summary.json"
     _render_ai_summary_block(cache_path=cache_path, ai_input=ai_input)
 
@@ -2949,151 +3006,252 @@ def render_new_run_page():
         render_run_progress()
         return
     
-    with st.form("new_run_form"):
-        st.subheader("Search Parameters")
-        
+    # ─────────────────────────────────────────────────────────────────────────
+    # Search Mode Selection
+    # ─────────────────────────────────────────────────────────────────────────
+    search_mode = st.radio(
+        "Search Mode",
+        ["Single Search", "Bundle Search"],
+        horizontal=True,
+        key="new_run_search_mode",
+        help="Single Search: one keyword phrase. Bundle Search: multiple keyword phrases combined."
+    )
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Search Parameters Section
+    # ─────────────────────────────────────────────────────────────────────────
+    st.subheader("🔎 Search Parameters")
+    
+    # Get bundles from settings
+    bundles = settings.get("bundles", DEFAULT_SETTINGS.get("bundles", {}))
+    
+    if search_mode == "Single Search":
         col1, col2 = st.columns(2)
         
         with col1:
             keywords = st.text_input(
                 "Job Keywords",
                 value=ui_settings.get("default_keywords", "help desk it"),
-                help="Job title or keywords to search for"
+                help="Job title or keywords to search for",
+                key="new_run_keywords"
             )
         
         with col2:
             location = st.text_input(
                 "Location",
                 value=ui_settings.get("default_location", "Auburn NSW"),
-                help="City, suburb, or region"
+                help="City, suburb, or region",
+                key="new_run_location"
             )
         
-        # Advanced settings in expander
-        with st.expander("⚙️ Advanced Settings", expanded=False):
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                pages = st.number_input(
-                    "Max Pages",
-                    min_value=1,
-                    max_value=20,
-                    value=scraper_settings.get("pages", 3),
-                    help="Maximum pages to scrape per site"
-                )
-                
-                source = st.selectbox(
-                    "Source",
-                    options=["all", "seek", "jora"],
-                    index=["all", "seek", "jora"].index(scraper_settings.get("source", "all")),
-                    help="Which job site(s) to scrape"
-                )
-            
-            with col2:
-                workers = st.number_input(
-                    "Workers",
-                    min_value=1,
-                    max_value=20,
-                    value=scraper_settings.get("workers", 10),
-                    help="Parallel browser workers (recommended: 10 for 6-core CPU)"
-                )
-                
-                delay = st.number_input(
-                    "Delay (seconds)",
-                    min_value=0.5,
-                    max_value=10.0,
-                    value=float(scraper_settings.get("delay", 1.5)),
-                    step=0.5,
-                    help="Delay between requests"
-                )
-            
-            with col3:
-                max_details_setting = scraper_settings.get("max_details")
-                fetch_all_by_default = max_details_setting is None or (
-                    isinstance(max_details_setting, int) and max_details_setting != 0
-                )
-                detail_choice_index = 0 if fetch_all_by_default else 1
-                detail_choice_label = st.selectbox(
-                    "Max Details",
-                    options=DETAIL_FETCH_LABELS,
-                    index=detail_choice_index,
-                    help="Fetch detail pages for every job or skip them to speed up scraping."
-                )
-                max_details = DETAIL_FETCH_VALUES[detail_choice_label]
-                
-                fuzzy = st.checkbox(
-                    "Fuzzy Search",
-                    value=scraper_settings.get("fuzzy", False),
-                    help="Expand search with related terms"
-                )
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                visible = st.checkbox(
-                    "Show Browser",
-                    value=scraper_settings.get("visible", False),
-                    help="Show browser window during scraping"
-                )
-            
-            with col2:
-                sequential = st.checkbox(
-                    "Sequential Mode",
-                    value=scraper_settings.get("sequential", False),
-                    help="Fetch job details one at a time (slower but uses less resources)"
-                )
+        keywords_list = None  # Not using bundle mode
+        bundle_ids = None
+    
+    else:  # Bundle Search
+        # Bundle selection
+        bundle_names = list(bundles.keys())
         
-        submitted = st.form_submit_button("🚀 Start Run", type="primary", use_container_width=True)
+        if not bundle_names:
+            st.warning("No bundles configured. Add bundles in Settings or use Single Search mode.")
+            return
         
-        if submitted:
-            # Build command
-            cmd = [
-                sys.executable,
-                "-u",
-                str(Path(__file__).parent / "main.py"),
-                "--keywords", keywords,
-                "--location", location,
-                "--pages", str(pages),
-                "--source", source,
-                "--workers", str(workers),
-                "--delay", str(delay),
-            ]
-            
-            if max_details and max_details > 0:
-                cmd.extend(["--max-details", str(max_details)])
-            
-            if fuzzy:
-                cmd.append("--fuzzy")
-            else:
-                cmd.append("--no-fuzzy")
-            
-            if visible:
-                cmd.append("--visible")
-            
-            if sequential:
-                cmd.append("--sequential")
-            
-            # Create log file
-            LOGS_DIR.mkdir(parents=True, exist_ok=True)
-            log_file = LOGS_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-            
-            # Start process
-            env = os.environ.copy()
-            env["PYTHONUNBUFFERED"] = "1"
+        selected_bundles = st.multiselect(
+            "Select Bundle(s)",
+            options=bundle_names,
+            default=[bundle_names[0]] if bundle_names else [],
+            help="Select one or more keyword bundles to search",
+            key="new_run_selected_bundles"
+        )
 
-            with open(log_file, "w", encoding="utf-8") as f:
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=f,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    env=env,
-                    cwd=str(Path(__file__).parent)
-                )
+        st.caption("Each phrase runs as a separate scrape; results are merged with early dedup.")
+        
+        # Show what keywords are in the selected bundles
+        if selected_bundles:
+            all_keywords = []
+            for bundle_name in selected_bundles:
+                all_keywords.extend(bundles.get(bundle_name, []))
             
-            st.session_state.run_process = process
-            st.session_state.run_log_file = str(log_file)
-            save_run_state(process.pid, str(log_file))
-            st.rerun()
+            with st.expander(f"📋 Keywords in selected bundle(s) ({len(all_keywords)} total)", expanded=False):
+                for bundle_name in selected_bundles:
+                    bundle_keywords = bundles.get(bundle_name, [])
+                    st.markdown(f"**{bundle_name}:** {', '.join(bundle_keywords)}")
+        
+        location = st.text_input(
+            "Location",
+            value=ui_settings.get("default_location", "Auburn NSW"),
+            help="City, suburb, or region",
+            key="new_run_location_bundle"
+        )
+        
+        # Prepare bundle data for command
+        keywords_list = []
+        bundle_ids = []
+        for bundle_name in selected_bundles:
+            bundle_keywords = bundles.get(bundle_name, [])
+            keywords_list.extend(bundle_keywords)
+            bundle_ids.append(bundle_name)
+        
+        keywords = None  # Not using single keyword mode
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Scraping Options Section
+    # ─────────────────────────────────────────────────────────────────────────
+    with st.expander("⚙️ Scraping Options", expanded=False):
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            pages = st.number_input(
+                "Max Pages",
+                min_value=1,
+                max_value=20,
+                value=scraper_settings.get("pages", 3),
+                help="Maximum pages to scrape per site",
+                key="new_run_pages"
+            )
+            
+            source = st.selectbox(
+                "Source",
+                options=["all", "seek", "jora"],
+                index=["all", "seek", "jora"].index(scraper_settings.get("source", "all")),
+                help="Which job site(s) to scrape",
+                key="new_run_source"
+            )
+        
+        with col2:
+            workers = st.number_input(
+                "Workers",
+                min_value=1,
+                max_value=20,
+                value=scraper_settings.get("workers", 10),
+                help="Parallel browser workers (recommended: 10 for 6-core CPU)",
+                key="new_run_workers"
+            )
+            
+            delay = st.number_input(
+                "Delay (seconds)",
+                min_value=0.5,
+                max_value=10.0,
+                value=float(scraper_settings.get("delay", 1.5)),
+                step=0.5,
+                help="Delay between requests",
+                key="new_run_delay"
+            )
+        
+        with col3:
+            max_details_setting = scraper_settings.get("max_details")
+            fetch_all_by_default = max_details_setting is None or (
+                isinstance(max_details_setting, int) and max_details_setting != 0
+            )
+            detail_choice_index = 0 if fetch_all_by_default else 1
+            detail_choice_label = st.selectbox(
+                "Max Details",
+                options=DETAIL_FETCH_LABELS,
+                index=detail_choice_index,
+                help="Fetch detail pages for every job or skip them to speed up scraping.",
+                key="new_run_max_details"
+            )
+            max_details = DETAIL_FETCH_VALUES[detail_choice_label]
+            
+            fuzzy = st.checkbox(
+                "Fuzzy Search",
+                value=scraper_settings.get("fuzzy", False),
+                help="Expand search with related terms",
+                key="new_run_fuzzy"
+            )
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            visible = st.checkbox(
+                "Show Browser",
+                value=scraper_settings.get("visible", False),
+                help="Show browser window during scraping",
+                key="new_run_visible"
+            )
+        
+        with col2:
+            sequential = st.checkbox(
+                "Sequential Mode",
+                value=scraper_settings.get("sequential", False),
+                help="Fetch job details one at a time (slower but uses less resources)",
+                key="new_run_sequential"
+            )
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Submit Section (visually separated)
+    # ─────────────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    
+    # Validation
+    can_submit = True
+    if search_mode == "Single Search":
+        if not keywords or not keywords.strip():
+            can_submit = False
+    else:  # Bundle Search
+        if not keywords_list:
+            can_submit = False
+    
+    if not location or not location.strip():
+        can_submit = False
+    
+    if st.button("🚀 Start Run", type="primary", use_container_width=True, disabled=not can_submit):
+        # Build command
+        cmd = [
+            sys.executable,
+            "-u",
+            str(Path(__file__).parent / "main.py"),
+            "--location", location,
+            "--pages", str(pages),
+            "--source", source,
+            "--workers", str(workers),
+            "--delay", str(delay),
+        ]
+        
+        # Add keywords based on search mode
+        if search_mode == "Single Search":
+            cmd.extend(["--keywords", keywords])
+        else:
+            # Bundle mode: use --keywords-list
+            cmd.extend(["--keywords-list", json.dumps(keywords_list)])
+            if bundle_ids:
+                cmd.extend(["--bundle-ids", ",".join(bundle_ids)])
+        
+        if max_details and max_details > 0:
+            cmd.extend(["--max-details", str(max_details)])
+        
+        if fuzzy and search_mode == "Single Search":
+            cmd.append("--fuzzy")
+        else:
+            cmd.append("--no-fuzzy")
+        
+        if visible:
+            cmd.append("--visible")
+        
+        if sequential:
+            cmd.append("--sequential")
+        
+        # Create log file
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        log_file = LOGS_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        
+        # Start process
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+
+        with open(log_file, "w", encoding="utf-8") as f:
+            process = subprocess.Popen(
+                cmd,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+                cwd=str(Path(__file__).parent)
+            )
+        
+        st.session_state.run_process = process
+        st.session_state.run_log_file = str(log_file)
+        save_run_state(process.pid, str(log_file))
+        st.rerun()
 
 
 def render_run_progress():
@@ -3192,12 +3350,23 @@ def render_run_progress():
             clear_run_state()
             st.warning("Run cancelled.")
             st.rerun()
-        
+
         # Auto-refresh
+        # IMPORTANT: Avoid `time.sleep()` + `st.rerun()` loops here.
+        # Those can interrupt the script before Streamlit finishes a run, which may
+        # leave prior-view elements visible below this progress UI.
         st.markdown("*Page auto-refreshes every 1 second...*")
-        import time
-        time.sleep(1)
-        st.rerun()
+        st.components.v1.html(
+            """
+            <script>
+              setTimeout(function() {
+                window.location.reload();
+              }, 1000);
+            </script>
+            """,
+            height=0,
+        )
+        return
     
     else:
         # Process finished
@@ -3377,7 +3546,9 @@ def render_settings_page():
                     },
                     "ai": {
                         "model": ai_model
-                    }
+                    },
+                    # Preserve any existing bundles (or defaults) even though this form doesn't edit them.
+                    "bundles": settings.get("bundles") or DEFAULT_SETTINGS.get("bundles", {}),
                 }
                 save_settings(new_settings)
                 st.success("Settings saved!")

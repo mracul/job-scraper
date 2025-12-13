@@ -211,12 +211,12 @@ def analyze_ui():
                 print("This run doesn't have compiled_jobs.md.")
                 return
             analyzer = JobRequirementsAnalyzer()
-            jobs = analyzer.extract_jobs_from_markdown(str(compiled))
+            jobs, search_meta = analyzer.extract_jobs_from_markdown(str(compiled))
             if not jobs:
                 print("No jobs found in compiled_jobs.md.")
                 return
-            analysis = analyzer.analyze_all_jobs(jobs)
-            analyzer.generate_report(analysis, str(run))
+            analysis = analyzer.analyze_all_jobs(jobs, dedupe=True)
+            analyzer.generate_report(analysis, str(run), search_metadata=search_meta)
 
         print(f"\nOpening report index: {index_path}")
         browse_requirements_index(str(index_path))
@@ -225,23 +225,35 @@ def analyze_ui():
     # Otherwise, aggregate jobs from all selected compiled files
     analyzer = JobRequirementsAnalyzer()
     all_jobs = []
+    combined_keywords = []
+    combined_locations = []
     for run in selected_runs:
         compiled = run / "compiled_jobs.md"
         if not compiled.exists():
             continue
-        jobs = analyzer.extract_jobs_from_markdown(str(compiled))
+        jobs, meta = analyzer.extract_jobs_from_markdown(str(compiled))
         all_jobs.extend(jobs)
+        if meta.get('keywords'):
+            combined_keywords.append(meta['keywords'])
+        if meta.get('location'):
+            combined_locations.append(meta['location'])
     
     if not all_jobs:
         print("No compiled job data found in selected runs.")
         return
     
+    # Build combined metadata
+    combined_meta = {
+        'keywords': ', '.join(dict.fromkeys(combined_keywords)) or None,
+        'location': ', '.join(dict.fromkeys(combined_locations)) or None,
+    }
+    
     print(f"\nAnalyzing {len(all_jobs)} jobs from {len(selected_runs)} run(s)...")
-    analysis = analyzer.analyze_all_jobs(all_jobs)
+    analysis = analyzer.analyze_all_jobs(all_jobs, dedupe=True)
     # Save a combined report under outputs/ (keep repo root clean)
     output_dir = Path("outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
-    report = analyzer.generate_report(analysis, str(output_dir))
+    report = analyzer.generate_report(analysis, str(output_dir), search_metadata=combined_meta)
     print(report)
 
 
@@ -664,10 +676,12 @@ Examples:
         # Pass bundle metadata for enhanced header
         collection.to_compiled_text()
         collection.to_markdown(bundle_metadata=bundle_metadata)
-        
+        collection.to_jsonl(bundle_metadata=bundle_metadata)
+
         print(f"\n📁 All data saved to: {run_folder}")
         print(f"   📄 compiled_jobs.txt - Plain text for AI analysis")
         print(f"   📄 compiled_jobs.md  - Markdown format")
+        print(f"   📄 jobs.jsonl        - Machine-readable (recommended for analysis)")
         print(f"   📄 all_jobs.{args.format}   - Structured data")
         print(f"   📂 jobs/            - Individual job files")
         
@@ -679,13 +693,15 @@ Examples:
         try:
             from analyze_requirements import JobRequirementsAnalyzer
             import os
-            
-            compiled_file = os.path.join(run_folder, "compiled_jobs.md")
-            if os.path.exists(compiled_file):
+
+            jsonl_file = os.path.join(run_folder, "jobs.jsonl")
+            md_file = os.path.join(run_folder, "compiled_jobs.md")
+            input_file = jsonl_file if os.path.exists(jsonl_file) else md_file
+            if os.path.exists(input_file):
                 analyzer = JobRequirementsAnalyzer()
-                jobs_data = analyzer.extract_jobs_from_markdown(compiled_file)
-                analysis = analyzer.analyze_all_jobs(jobs_data)
-                report = analyzer.generate_report(analysis, run_folder)
+                jobs_data, search_meta = analyzer.extract_jobs(input_file)
+                analysis = analyzer.analyze_all_jobs(jobs_data, dedupe=True)
+                report = analyzer.generate_report(analysis, run_folder, search_metadata=search_meta)
                 print(report)
         except Exception as e:
             print(f"Note: Could not run requirements analysis: {e}")
