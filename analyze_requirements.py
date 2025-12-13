@@ -161,6 +161,7 @@ class JobRequirementsAnalyzer:
             '1-2 years': r'\b1[\s-]*(to|-)?\s*2\s*years?\b',
             '2-3 years': r'\b2[\s-]*(to|-)?\s*3\s*years?\b',
             '3-5 years': r'\b3[\s-]*(to|-)?\s*5\s*years?\b',
+            'MSP': r'\bMSP\b|\bmanaged\s+service\s+providers?\b',
             'MSP Experience': r'\bMSP\b.*?experience|experience.*?\bMSP\b',
             'Service Desk Experience': r'\b[Ss]ervice\s*[Dd]esk\b.*?experience',
             'Help Desk Experience': r'\b[Hh]elp\s*[Dd]esk\b.*?experience',
@@ -204,7 +205,13 @@ class JobRequirementsAnalyzer:
         self.benefits = {
             'NFP/Salary Packaging': r'\b(NFP|[Nn]ot[\s-]*[Ff]or[\s-]*[Pp]rofit|[Ss]alary\s*[Pp]ackaging)\b',
             'Career Development': r'\b[Cc]areer\s*([Dd]evelopment|[Pp]rogression|[Gg]rowth)\b',
-            'Training/Certification': r'\b([Tt]raining|[Cc]ertification)\s*([Oo]pportunit|[Ss]upport|[Pp]rovided)?\b',
+            # Training-related benefits (explicit signals that training is provided/supported)
+            'Training Provided': r'\b(full\s+training|comprehensive\s+training|paid\s+training|training\s+(provided|included|available)|on[\s-]*the[\s-]*job\s+training|we\s+will\s+train\s+you)\b',
+            'Mentoring/Coaching': r'\b(mentor(ing)?|coaching|buddy\s+system)\b',
+            'Professional Development': r'\b(professional\s+development|learning\s*(and|&)\s*development|L\s*&\s*D|upskilling|training\s*(and|&)\s*development)\b',
+            'Certification Support': r'\b(certification\s*(support|assistance|reimburs(e|ed|ement)|fund(ed|ing)|paid)|paid\s+certifications?)\b',
+            # Backwards-compatible umbrella tag (kept, but tightened to benefit-like phrasing)
+            'Training/Certification': r'\b(training|certification)\s*(opportunit(y|ies)|support|provided|available|fund(ed|ing)|reimburs(e|ed|ement)|assistance)\b',
             'Gym/Fitness Benefits': r'\b([Gg]ym|[Ff]itness\s*[Pp]assport|[Ff]itness\s*[Bb]enefit)\b',
             'Free Parking': r'\b([Ff]ree\s*[Pp]arking|[Pp]arking\s*[Oo]n[\s-]*[Ss]ite)\b',
             'Company Vehicle': r'\b[Cc]ompany\s*([Vv]ehicle|[Cc]ar)\b',

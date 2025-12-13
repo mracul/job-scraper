@@ -176,28 +176,66 @@ def _build_ai_summary_input(
     }
 
 
-AI_SUMMARY_SYSTEM_PROMPT = (
-    "You are a helpful career coach for people looking to enter or advance in IT support and help desk roles. "
-    "Write a detailed, well-formatted overview using ONLY the aggregated tag percentages provided. "
-    "Your goal is to give insight and guidance to someone seeking direction in this field.\n\n"
-    "Format your response using Markdown for readability:\n"
-    "- Use **bold** for emphasis on key terms\n"
-    "- Use bullet points or numbered lists where appropriate\n"
-    "- Separate sections with line breaks\n\n"
-    "Cover ALL of the following areas (only if there is data for them):\n\n"
-    "**📜 Certifications**: Which certifications appear most in-demand? Explain what to prioritize and why, using the certification names present in the data.\n\n"
-    "**💻 Technical Skills**: Which technical skills/tools/technologies appear most often? Explain how they connect to likely learning paths and certifications, using only terms present in the data.\n\n"
-    "**🤝 Soft Skills**: Which soft skills do employers value? Explain their importance relative to technical skills using percentages.\n\n"
-    "**📅 Experience Levels**: What experience levels are employers seeking? Comment on how accessible the roles look for newcomers versus experienced applicants.\n\n"
-    "**🏢 Work Arrangements**: What work arrangements are common? Mention trends suggested by the percentages.\n\n"
-    "**🚀 Career Development Path**: Suggest a practical path based strictly on what shows up in the data (what to learn first, what to learn next, what signals to target).\n\n"
-    "**🔍 Search Context**: Briefly relate the original search terms and locations to the demand signals in the data.\n\n"
-    "Important: Each category includes metadata like total_unique/included/truncated. If truncated is true, briefly note that only the top terms were provided for that category.\n\n"
-    "Use concrete terms from the data and describe relative demand with percentages. "
-    "Be encouraging but realistic. Do not invent facts, salaries, or claim certainty."
-)
+AI_SUMMARY_SYSTEM_PROMPT = """You are a career coach helping people enter or progress in IT support and help desk roles, using aggregated job market data to guide efficient decision-making.
 
-AI_SUMMARY_MAX_OUTPUT_TOKENS = 1800
+You will be given aggregated tag percentages derived from job listings. Your task is to analyze these signals and translate them into practical guidance on where a candidate should focus their effort.
+
+Core Principles
+
+- Base your analysis only on the provided data. Do not introduce technologies, certifications, or requirements that do not appear in the tags.
+- Use percentages to explain relative demand and priority, not to dump data.
+- Focus on patterns, trade-offs, and implications, not exhaustive lists.
+- Be realistic and encouraging; avoid claiming certainty.
+
+Output Expectations
+
+- Write a clear, well-structured Markdown overview.
+- Use **bold** to highlight key signals.
+- Keep examples limited (a few representative terms per theme), always grounded with percentages.
+- When a category is truncated, briefly note that only the top signals are visible.
+
+What to Cover (when data exists)
+
+Market Signals & Direction
+
+- What the data suggests about employer priorities overall.
+- Whether demand appears concentrated around a few signals or spread across many.
+
+Certifications & Credentials
+
+- Which certifications stand out by demand.
+- How a candidate might sensibly prioritize them (e.g., first vs later), based on relative frequency and role fit.
+
+Technical Skill Focus
+
+- Which technical skills/tools appear most often.
+- What those signals imply about what to practice, lab, or demonstrate.
+
+Professional & Soft Skills
+
+- How soft skills show up relative to technical requirements.
+- What that implies for day-to-day work and hiring decisions.
+
+Practical Development Guidance
+
+Translate the data into concrete next steps:
+
+- learning focus
+- practice or lab ideas
+- signals to target in resumes or interviews
+
+Experience level and work arrangement signals should be woven naturally into the analysis where they add context, rather than treated as standalone topics.
+
+Search Context
+
+Briefly relate the original search terms and locations (if provided) to the observed demand patterns.
+
+Intent
+
+Your goal is not to prescribe a single path, but to help the reader allocate their time and energy efficiently based on what the market is actually asking for.
+"""
+
+AI_SUMMARY_MAX_OUTPUT_TOKENS = 2400
 AI_SUMMARY_TOP_N_SINGLE = 50
 AI_SUMMARY_TOP_N_COMPILED = 75
 
@@ -330,10 +368,16 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict) -> None:
             summary_text = None
 
     if summary_text:
-        with st.container():
-            st.markdown(summary_text)
+        # Fixed-size, scrollable view
+        st.text_area(
+            "",
+            value=summary_text,
+            height=260,
+            label_visibility="collapsed",
+            key=f"ai_summary_box_{cache_path.name}_{input_hash[:8]}",
+        )
 
-    col1, col2, _ = st.columns([1, 1, 2])
+    col1, col2, col3, _ = st.columns([1, 1, 1, 2])
     with col1:
         label = "Regenerate" if summary_text else "Generate"
         if st.button(f"✨ {label} summary", use_container_width=True, key=f"gen_{cache_path.name}_{input_hash[:8]}"):
@@ -363,6 +407,18 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict) -> None:
             except Exception:
                 pass
             st.rerun()
+    with col3:
+        if summary_text and st.button("⤢ Expand", use_container_width=True, key=f"exp_{cache_path.name}_{input_hash[:8]}"):
+            if hasattr(st, "dialog"):
+                @st.dialog("🤖 AI Summary")
+                def _show_ai_summary_dialog(text: str):
+                    st.markdown(text)
+
+                _show_ai_summary_dialog(summary_text)
+            else:
+                # Fallback for older Streamlit: show a large expander.
+                with st.expander("AI Summary (expanded)", expanded=True):
+                    st.markdown(summary_text)
 
 # ============================================================================
 # Settings Persistence
@@ -578,6 +634,9 @@ def init_session_state():
         st.session_state.delete_modal_open = False
     if "last_url_state" not in st.session_state:
         st.session_state.last_url_state = None
+    if "nav_origin" not in st.session_state:
+        # Used to control where "Back" returns (e.g. compiled overview).
+        st.session_state.nav_origin = None
 
 
 def _get_query_params() -> dict:
@@ -826,8 +885,15 @@ def render_back_button():
             st.rerun()
     elif st.session_state.view_mode == "explorer":
         if st.button("← Back to Overview", key="back_from_explorer"):
-            st.session_state.view_mode = "overview"
-            st.session_state.viewing_job_id = None
+            # If user drilled in from compiled overview, return there.
+            if st.session_state.get("nav_origin") == "compiled":
+                st.session_state.selected_run = None
+                st.session_state.view_mode = "compiled_overview"
+                st.session_state.viewing_job_id = None
+                st.session_state.nav_origin = None
+            else:
+                st.session_state.view_mode = "overview"
+                st.session_state.viewing_job_id = None
             _sync_url_with_state()
             st.rerun()
     elif st.session_state.view_mode == "compiled_overview":
@@ -1132,7 +1198,8 @@ def render_compiled_overview():
             continue
 
         with st.expander(f"{category_label} ({len(data)} items)", expanded=False):
-            sorted_items = sorted(data.items(), key=lambda x: x[1], reverse=True)[:15]
+            sorted_items_full = sorted(data.items(), key=lambda x: x[1], reverse=True)
+            sorted_items = sorted_items_full[:15]
             df = pd.DataFrame(
                 [
                     {
@@ -1144,28 +1211,23 @@ def render_compiled_overview():
                 ]
             )
 
+            # Full list for expanded view
+            df_full = pd.DataFrame(
+                [
+                    {
+                        "term": term,
+                        "count": count,
+                        "percentage": (count / total_jobs * 100) if total_jobs > 0 else 0,
+                    }
+                    for term, count in sorted_items_full
+                ]
+            )
+
             if df.empty:
                 st.info("No data")
                 continue
 
-            fig = px.bar(
-                df,
-                y="term",
-                x="percentage",
-                orientation="h",
-                text=df.apply(lambda r: f"{r['count']} ({r['percentage']:.1f}%)", axis=1),
-                labels={"term": "", "percentage": "% of Jobs"},
-                height=max(300, len(df) * 25),
-            )
-            fig.update_layout(
-                yaxis={"categoryorder": "total ascending"},
-                showlegend=False,
-                margin=dict(l=0, r=0, t=10, b=10),
-                clickmode="event+select",
-                dragmode="select",
-            )
-            fig.update_traces(textposition="outside")
-            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Select a requirement row to view matching jobs:")
 
             table_df = df[["term", "count", "percentage"]].rename(
                 columns={"term": "Requirement", "count": "Jobs", "percentage": "% of Total"}
@@ -1186,60 +1248,168 @@ def render_compiled_overview():
                 selected_rows = (table_state.selection.rows or []) if table_state and table_state.selection else []
             except Exception:
                 selected_rows = []
+            selected_term_key = f"compiled_selected_term_{category_key}"
             if selected_rows:
                 row_idx = selected_rows[0]
                 if 0 <= row_idx < len(df):
-                    term_clicked = str(df.iloc[row_idx]["term"])
-                    target_candidates = run_term_index.get(category_key, {}).get(term_clicked, [])
-                    if target_candidates:
-                        target_run = sorted(
-                            target_candidates,
-                            key=lambda t: (t[0], t[1].stat().st_mtime if t[1].exists() else 0),
-                            reverse=True,
-                        )[0][1]
-                    else:
-                        target_run = run_paths[0]
-                    navigate_to(
-                        "reports",
-                        selected_run=str(target_run),
-                        view_mode="explorer",
-                        viewing_job_id=None,
-                        selected_filters={category_key: [term_clicked]},
-                        filter_mode="any",
-                        search_text="",
-                        compiled_runs=[],
-                    )
-                    st.rerun()
+                    st.session_state[selected_term_key] = str(df.iloc[row_idx]["term"])
 
-            st.caption("Click a requirement to view matching jobs:")
-            cols = st.columns(min(4, len(sorted_items)))
-            for idx, (term, count) in enumerate(sorted_items):
-                col_idx = idx % len(cols)
-                with cols[col_idx]:
-                    if st.button(f"{term} ({count})", key=f"compiled_req_{category_key}_{term}", use_container_width=True):
-                        target_candidates = run_term_index.get(category_key, {}).get(term, [])
-                        target_run = None
-                        if target_candidates:
-                            target_run = sorted(
-                                target_candidates,
-                                key=lambda t: (t[0], t[1].stat().st_mtime if t[1].exists() else 0),
-                                reverse=True,
-                            )[0][1]
-                        else:
-                            target_run = run_paths[0]
-                        navigate_to(
-                            "reports",
-                            selected_run=str(target_run),
-                            view_mode="explorer",
-                            viewing_job_id=None,
-                            selected_filters={category_key: [term]},
-                            filter_mode="any",
-                            search_text="",
-                            compiled_runs=[],
+            selected_term = st.session_state.get(selected_term_key)
+            if selected_term and st.button(
+                "View matching jobs",
+                type="primary",
+                use_container_width=True,
+                key=f"compiled_view_jobs_{category_key}",
+            ):
+                target_candidates = run_term_index.get(category_key, {}).get(selected_term, [])
+                if target_candidates:
+                    target_run = sorted(
+                        target_candidates,
+                        key=lambda t: (t[0], t[1].stat().st_mtime if t[1].exists() else 0),
+                        reverse=True,
+                    )[0][1]
+                else:
+                    target_run = run_paths[0]
+                st.session_state.nav_origin = "compiled"
+                navigate_to(
+                    "reports",
+                    selected_run=str(target_run),
+                    view_mode="explorer",
+                    viewing_job_id=None,
+                    selected_filters={category_key: [selected_term]},
+                    filter_mode="any",
+                    search_text="",
+                    # Keep compiled_runs so Back can return to compiled overview.
+                    compiled_runs=list(st.session_state.get("compiled_runs") or []),
+                )
+                st.rerun()
+
+            if len(sorted_items_full) > 15 and st.button(
+                "⤢ Expand list",
+                use_container_width=True,
+                key=f"compiled_expand_{category_key}",
+            ):
+                if hasattr(st, "dialog"):
+                    @st.dialog(f"{category_label} — All Items")
+                    def _show_compiled_full_table(cat_key: str, df_all: pd.DataFrame):
+                        st.caption("Select a requirement row to view matching jobs:")
+                        table_df_full = df_all[["term", "count", "percentage"]].rename(
+                            columns={"term": "Requirement", "count": "Jobs", "percentage": "% of Total"}
                         )
-                        st.rerun()
+                        table_state_full = st.dataframe(
+                            table_df_full,
+                            hide_index=True,
+                            use_container_width=True,
+                            height=520,
+                            selection_mode="single-row",
+                            on_select="rerun",
+                            key=f"compiled_table_full_{cat_key}",
+                        )
 
-            # (Plotly click-to-navigate removed; use table row selection above.)
+                        selected_rows_full = []
+                        try:
+                            selected_rows_full = (
+                                (table_state_full.selection.rows or [])
+                                if table_state_full and table_state_full.selection
+                                else []
+                            )
+                        except Exception:
+                            selected_rows_full = []
+                        selected_term_key_full = f"compiled_selected_term_full_{cat_key}"
+                        if selected_rows_full:
+                            row_idx_full = selected_rows_full[0]
+                            if 0 <= row_idx_full < len(df_all):
+                                st.session_state[selected_term_key_full] = str(df_all.iloc[row_idx_full]["term"])
+
+                        selected_term_full = st.session_state.get(selected_term_key_full)
+                        if selected_term_full and st.button(
+                            "View matching jobs",
+                            type="primary",
+                            use_container_width=True,
+                            key=f"compiled_view_jobs_full_{cat_key}",
+                        ):
+                            target_candidates_full = run_term_index.get(cat_key, {}).get(selected_term_full, [])
+                            if target_candidates_full:
+                                target_run_full = sorted(
+                                    target_candidates_full,
+                                    key=lambda t: (t[0], t[1].stat().st_mtime if t[1].exists() else 0),
+                                    reverse=True,
+                                )[0][1]
+                            else:
+                                target_run_full = run_paths[0]
+                            st.session_state.nav_origin = "compiled"
+                            navigate_to(
+                                "reports",
+                                selected_run=str(target_run_full),
+                                view_mode="explorer",
+                                viewing_job_id=None,
+                                selected_filters={cat_key: [selected_term_full]},
+                                filter_mode="any",
+                                search_text="",
+                                compiled_runs=list(st.session_state.get("compiled_runs") or []),
+                            )
+                            st.rerun()
+
+                    _show_compiled_full_table(category_key, df_full)
+                else:
+                    with st.expander("All items", expanded=True):
+                        table_df_full = df_full[["term", "count", "percentage"]].rename(
+                            columns={"term": "Requirement", "count": "Jobs", "percentage": "% of Total"}
+                        )
+                        table_state_full = st.dataframe(
+                            table_df_full,
+                            hide_index=True,
+                            use_container_width=True,
+                            height=520,
+                            selection_mode="single-row",
+                            on_select="rerun",
+                            key=f"compiled_table_full_{category_key}",
+                        )
+
+                        selected_rows_full = []
+                        try:
+                            selected_rows_full = (
+                                (table_state_full.selection.rows or [])
+                                if table_state_full and table_state_full.selection
+                                else []
+                            )
+                        except Exception:
+                            selected_rows_full = []
+                        selected_term_key_full = f"compiled_selected_term_full_{category_key}"
+                        if selected_rows_full:
+                            row_idx_full = selected_rows_full[0]
+                            if 0 <= row_idx_full < len(df_full):
+                                st.session_state[selected_term_key_full] = str(df_full.iloc[row_idx_full]["term"])
+
+                        selected_term_full = st.session_state.get(selected_term_key_full)
+                        if selected_term_full and st.button(
+                            "View matching jobs",
+                            type="primary",
+                            use_container_width=True,
+                            key=f"compiled_view_jobs_full_{category_key}",
+                        ):
+                            target_candidates_full = run_term_index.get(category_key, {}).get(selected_term_full, [])
+                            if target_candidates_full:
+                                target_run_full = sorted(
+                                    target_candidates_full,
+                                    key=lambda t: (t[0], t[1].stat().st_mtime if t[1].exists() else 0),
+                                    reverse=True,
+                                )[0][1]
+                            else:
+                                target_run_full = run_paths[0]
+                            st.session_state.nav_origin = "compiled"
+                            navigate_to(
+                                "reports",
+                                selected_run=str(target_run_full),
+                                view_mode="explorer",
+                                viewing_job_id=None,
+                                selected_filters={category_key: [selected_term_full]},
+                                filter_mode="any",
+                                search_text="",
+                                compiled_runs=list(st.session_state.get("compiled_runs") or []),
+                            )
+                            st.rerun()
+
 
 
 def render_report_overview():
@@ -1329,35 +1499,20 @@ def render_report_overview():
         
         with st.expander(f"{category_label} ({len(data)} items)", expanded=False):
             # Prepare data for chart
-            sorted_items = sorted(data.items(), key=lambda x: x[1], reverse=True)[:15]  # Top 15
+            sorted_items_full = sorted(data.items(), key=lambda x: x[1], reverse=True)
+            sorted_items = sorted_items_full[:15]  # Top 15
             df = pd.DataFrame([
                 {"term": term, "count": count, "percentage": (count / total_jobs * 100) if total_jobs > 0 else 0}
                 for term, count in sorted_items
             ])
+
+            df_full = pd.DataFrame([
+                {"term": term, "count": count, "percentage": (count / total_jobs * 100) if total_jobs > 0 else 0}
+                for term, count in sorted_items_full
+            ])
             
             if not df.empty:
-                # Horizontal bar chart
-                fig = px.bar(
-                    df,
-                    y="term",
-                    x="percentage",
-                    orientation="h",
-                    text=df.apply(lambda r: f"{r['count']} ({r['percentage']:.1f}%)", axis=1),
-                    labels={"term": "", "percentage": "% of Jobs"},
-                    height=max(300, len(df) * 25)
-                )
-                fig.update_layout(
-                    yaxis={"categoryorder": "total ascending"},
-                    showlegend=False,
-                    margin=dict(l=0, r=0, t=10, b=10),
-                    clickmode="event+select",
-                    dragmode="select",
-                )
-                fig.update_traces(textposition="outside")
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Clickable requirement buttons (double-click effect via single click navigation)
-                st.caption("Click a requirement to view matching jobs:")
+                st.caption("Select a requirement row to view matching jobs:")
                 table_df = df[["term", "count", "percentage"]].rename(
                     columns={"term": "Requirement", "count": "Jobs", "percentage": "% of Total"}
                 )
@@ -1375,37 +1530,133 @@ def render_report_overview():
                     selected_rows = (table_state.selection.rows or []) if table_state and table_state.selection else []
                 except Exception:
                     selected_rows = []
+                selected_term_key = f"report_selected_term_{category_key}"
                 if selected_rows:
                     row_idx = selected_rows[0]
                     if 0 <= row_idx < len(df):
-                        term_clicked = str(df.iloc[row_idx]["term"])
-                        navigate_to(
-                            "reports",
-                            selected_run=st.session_state.selected_run,
-                            view_mode="explorer",
-                            viewing_job_id=None,
-                            selected_filters={category_key: [term_clicked]},
-                            filter_mode="any",
-                            search_text=""
-                        )
-                        st.rerun()
+                        st.session_state[selected_term_key] = str(df.iloc[row_idx]["term"])
 
-                cols = st.columns(min(4, len(sorted_items)))
-                for idx, (term, count) in enumerate(sorted_items):
-                    col_idx = idx % len(cols)
-                    with cols[col_idx]:
-                        if st.button(f"{term} ({count})", key=f"req_{category_key}_{term}", use_container_width=True):
-                            navigate_to(
-                                "reports",
-                                selected_run=st.session_state.selected_run,
-                                view_mode="explorer",
-                                viewing_job_id=None,
-                                selected_filters={category_key: [term]},
-                                filter_mode="any",
-                                search_text=""
+                selected_term = st.session_state.get(selected_term_key)
+                if selected_term and st.button(
+                    "View matching jobs",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"report_view_jobs_{category_key}",
+                ):
+                    navigate_to(
+                        "reports",
+                        selected_run=st.session_state.selected_run,
+                        view_mode="explorer",
+                        viewing_job_id=None,
+                        selected_filters={category_key: [selected_term]},
+                        filter_mode="any",
+                        search_text="",
+                    )
+                    st.rerun()
+
+                if len(sorted_items_full) > 15 and st.button(
+                    "⤢ Expand list",
+                    use_container_width=True,
+                    key=f"report_expand_{category_key}",
+                ):
+                    if hasattr(st, "dialog"):
+                        @st.dialog(f"{category_label} — All Items")
+                        def _show_report_full_table(cat_key: str, df_all: pd.DataFrame):
+                            st.caption("Select a requirement row to view matching jobs:")
+                            table_df_full = df_all[["term", "count", "percentage"]].rename(
+                                columns={"term": "Requirement", "count": "Jobs", "percentage": "% of Total"}
                             )
-                            st.rerun()
-                # (Plotly click-to-navigate removed; use table row selection above.)
+                            table_state_full = st.dataframe(
+                                table_df_full,
+                                hide_index=True,
+                                use_container_width=True,
+                                height=520,
+                                selection_mode="single-row",
+                                on_select="rerun",
+                                key=f"report_table_full_{cat_key}",
+                            )
+
+                            selected_rows_full = []
+                            try:
+                                selected_rows_full = (
+                                    (table_state_full.selection.rows or [])
+                                    if table_state_full and table_state_full.selection
+                                    else []
+                                )
+                            except Exception:
+                                selected_rows_full = []
+                            selected_term_key_full = f"report_selected_term_full_{cat_key}"
+                            if selected_rows_full:
+                                row_idx_full = selected_rows_full[0]
+                                if 0 <= row_idx_full < len(df_all):
+                                    st.session_state[selected_term_key_full] = str(df_all.iloc[row_idx_full]["term"])
+
+                            selected_term_full = st.session_state.get(selected_term_key_full)
+                            if selected_term_full and st.button(
+                                "View matching jobs",
+                                type="primary",
+                                use_container_width=True,
+                                key=f"report_view_jobs_full_{cat_key}",
+                            ):
+                                navigate_to(
+                                    "reports",
+                                    selected_run=st.session_state.selected_run,
+                                    view_mode="explorer",
+                                    viewing_job_id=None,
+                                    selected_filters={cat_key: [selected_term_full]},
+                                    filter_mode="any",
+                                    search_text="",
+                                )
+                                st.rerun()
+
+                        _show_report_full_table(category_key, df_full)
+                    else:
+                        with st.expander("All items", expanded=True):
+                            table_df_full = df_full[["term", "count", "percentage"]].rename(
+                                columns={"term": "Requirement", "count": "Jobs", "percentage": "% of Total"}
+                            )
+                            table_state_full = st.dataframe(
+                                table_df_full,
+                                hide_index=True,
+                                use_container_width=True,
+                                height=520,
+                                selection_mode="single-row",
+                                on_select="rerun",
+                                key=f"report_table_full_{category_key}",
+                            )
+
+                            selected_rows_full = []
+                            try:
+                                selected_rows_full = (
+                                    (table_state_full.selection.rows or [])
+                                    if table_state_full and table_state_full.selection
+                                    else []
+                                )
+                            except Exception:
+                                selected_rows_full = []
+                            selected_term_key_full = f"report_selected_term_full_{category_key}"
+                            if selected_rows_full:
+                                row_idx_full = selected_rows_full[0]
+                                if 0 <= row_idx_full < len(df_full):
+                                    st.session_state[selected_term_key_full] = str(df_full.iloc[row_idx_full]["term"])
+
+                            selected_term_full = st.session_state.get(selected_term_key_full)
+                            if selected_term_full and st.button(
+                                "View matching jobs",
+                                type="primary",
+                                use_container_width=True,
+                                key=f"report_view_jobs_full_{category_key}",
+                            ):
+                                navigate_to(
+                                    "reports",
+                                    selected_run=st.session_state.selected_run,
+                                    view_mode="explorer",
+                                    viewing_job_id=None,
+                                    selected_filters={category_key: [selected_term_full]},
+                                    filter_mode="any",
+                                    search_text="",
+                                )
+                                st.rerun()
 
 
 def render_job_explorer():
@@ -1571,9 +1822,9 @@ def render_job_explorer():
                     date_value = job_row.get("date_posted")
                     if pd.notna(date_value) and date_value:
                         date_text = str(date_value)
-                
+
                 col1, col2 = st.columns([4, 1])
-                
+
                 with col1:
                     if st.button(f"{title} — {company}", key=f"job_title_{job_id}"):
                         navigate_to(
@@ -1585,7 +1836,7 @@ def render_job_explorer():
                         st.rerun()
                     if date_text:
                         st.caption(f"📅 {date_text}")
-                
+
                 with col2:
                     if st.button("View", key=f"view_job_{job_id}", use_container_width=True):
                         navigate_to(
