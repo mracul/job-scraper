@@ -6,12 +6,14 @@ A web interface for running job scrapes and exploring results.
 import streamlit as st
 import streamlit.components.v1
 import pandas as pd
+import requests
 import json
 import os
 import time
 import subprocess
 import sys
 import shutil
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -44,6 +46,9 @@ DEFAULT_SETTINGS = {
     "ui": {
         "default_keywords": "help desk it",
         "default_location": "Auburn NSW"
+    },
+    "ai": {
+        "model": "gpt-5-mini"
     }
 }
 
@@ -66,6 +71,299 @@ DETAIL_FETCH_LABELS = [label for label, _ in DETAIL_FETCH_OPTIONS]
 DETAIL_FETCH_VALUES = {label: value for label, value in DETAIL_FETCH_OPTIONS}
 FILTER_WIDGET_KEYS = [f"filter_{cat_key}" for cat_key in CATEGORY_LABELS]
 
+
+def _get_openai_api_key() -> str | None:
+    """Get OpenAI API key from Streamlit secrets or environment."""
+    for key_name in ("OPENAI_API_KEY", "openai_api_key"):
+        try:
+            value = st.secrets.get(key_name)
+        except Exception:
+            value = None
+        if value:
+            return str(value)
+    env_value = os.getenv("OPENAI_API_KEY")
+    return env_value or None
+
+
+def _stable_json_dumps(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _hash_payload(payload) -> str:
+    raw = _stable_json_dumps(payload).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _load_cached_ai_summary(cache_path: Path) -> dict | None:
+    if not cache_path.exists():
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _save_cached_ai_summary(cache_path: Path, data: dict) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _get_run_search_meta(run_path: Path) -> tuple[str | None, str | None]:
+    """Try to read search keywords/location from compiled_jobs.md header."""
+    md_path = run_path / "compiled_jobs.md"
+    if not md_path.exists():
+        return None, None
+    keywords = None
+    location = None
+    try:
+        with open(md_path, "r", encoding="utf-8", errors="replace") as f:
+            for _ in range(60):
+                line = f.readline()
+                if not line:
+                    break
+                if line.startswith("**Search Keywords:**"):
+                    keywords = line.replace("**Search Keywords:**", "").strip().rstrip("  ")
+                elif line.startswith("**Search Location:**"):
+                    location = line.replace("**Search Location:**", "").strip().rstrip("  ")
+                if keywords and location:
+                    break
+    except Exception:
+        return None, None
+    return keywords, location
+
+
+def _build_ai_summary_input(
+    *,
+    total_jobs: int,
+    summary: dict,
+    search_context: dict,
+    scope_label: str,
+    top_n_per_category: int = 25,
+) -> dict:
+    """Build payload of tag percentages to feed to the LLM.
+
+    Includes all categories, and the top N items per category. Adds metadata so the LLM can reason
+    about truncation (e.g. when only a subset of terms is included).
+    """
+    categories_payload = {}
+    limit = max(1, int(top_n_per_category))
+    for cat_key, cat_label in CATEGORY_LABELS.items():
+        items = (summary or {}).get(cat_key, {}) or {}
+        top_items = sorted(items.items(), key=lambda t: t[1], reverse=True)[:limit] if items else []
+        categories_payload[cat_key] = {
+            "label": cat_label,
+            "total_unique": len(items),
+            "included": len(top_items),
+            "truncated": len(items) > len(top_items),
+            "top": [
+                {
+                    "term": term,
+                    "count": int(count),
+                    "pct": round((float(count) / float(total_jobs) * 100.0), 1) if total_jobs else 0.0,
+                }
+                for term, count in top_items
+            ],
+        }
+
+    return {
+        "scope": scope_label,
+        "total_jobs": int(total_jobs or 0),
+        "search": search_context,
+        "categories": categories_payload,
+    }
+
+
+AI_SUMMARY_SYSTEM_PROMPT = (
+    "You are a helpful career coach for people looking to enter or advance in IT support and help desk roles. "
+    "Write a detailed, well-formatted overview using ONLY the aggregated tag percentages provided. "
+    "Your goal is to give insight and guidance to someone seeking direction in this field.\n\n"
+    "Format your response using Markdown for readability:\n"
+    "- Use **bold** for emphasis on key terms\n"
+    "- Use bullet points or numbered lists where appropriate\n"
+    "- Separate sections with line breaks\n\n"
+    "Cover ALL of the following areas (only if there is data for them):\n\n"
+    "**📜 Certifications**: Which certifications appear most in-demand? Explain what to prioritize and why, using the certification names present in the data.\n\n"
+    "**💻 Technical Skills**: Which technical skills/tools/technologies appear most often? Explain how they connect to likely learning paths and certifications, using only terms present in the data.\n\n"
+    "**🤝 Soft Skills**: Which soft skills do employers value? Explain their importance relative to technical skills using percentages.\n\n"
+    "**📅 Experience Levels**: What experience levels are employers seeking? Comment on how accessible the roles look for newcomers versus experienced applicants.\n\n"
+    "**🏢 Work Arrangements**: What work arrangements are common? Mention trends suggested by the percentages.\n\n"
+    "**🚀 Career Development Path**: Suggest a practical path based strictly on what shows up in the data (what to learn first, what to learn next, what signals to target).\n\n"
+    "**🔍 Search Context**: Briefly relate the original search terms and locations to the demand signals in the data.\n\n"
+    "Important: Each category includes metadata like total_unique/included/truncated. If truncated is true, briefly note that only the top terms were provided for that category.\n\n"
+    "Use concrete terms from the data and describe relative demand with percentages. "
+    "Be encouraging but realistic. Do not invent facts, salaries, or claim certainty."
+)
+
+AI_SUMMARY_MAX_OUTPUT_TOKENS = 1800
+AI_SUMMARY_TOP_N_SINGLE = 50
+AI_SUMMARY_TOP_N_COMPILED = 75
+
+
+def _fallback_summary_from_input(ai_input: dict) -> str:
+    """Simple fallback when AI generation fails - just show error message."""
+    total_jobs = ai_input.get("total_jobs", 0)
+    return (
+        f"⚠️ **AI summary generation failed.** Unable to analyze {total_jobs} job listings.\n\n"
+        "Please check your OpenAI API key in Settings or try again later."
+    )
+
+
+def _generate_ai_summary_text(ai_input: dict) -> str:
+    api_key = _get_openai_api_key()
+    if not api_key:
+        raise RuntimeError("Missing OPENAI_API_KEY. Add it to .streamlit/secrets.toml or env var.")
+
+    settings = load_settings()
+    ai_model = settings.get("ai", {}).get("model", "gpt-5-mini")
+
+    user_prompt = (
+        "Here is aggregated job-requirement data (counts and consolidated percentages) for the user's search. "
+        "Use it to produce the requested summary.\n\n"
+        f"DATA_JSON={_stable_json_dumps(ai_input)}"
+    )
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": ai_model,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": AI_SUMMARY_SYSTEM_PROMPT}]},
+            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+        ],
+        "max_output_tokens": AI_SUMMARY_MAX_OUTPUT_TOKENS,
+    }
+
+    url = "https://api.openai.com/v1/responses"
+    backoff_seconds = 1.0
+    resp = None
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(backoff_seconds)
+                backoff_seconds *= 2
+                continue
+            raise RuntimeError(f"OpenAI request failed: {exc}")
+
+        if resp.status_code in {429, 500, 502, 503, 504} and attempt < 2:
+            time.sleep(backoff_seconds)
+            backoff_seconds *= 2
+            continue
+
+        if resp.status_code >= 400:
+            raise RuntimeError(f"OpenAI API error ({resp.status_code}): {resp.text[:400]}")
+        break
+
+    if resp is None:
+        raise RuntimeError(f"OpenAI request failed: {last_error}")
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI API returned non-JSON response: {str(exc)[:200]}")
+    parts: list[str] = []
+    for out in data.get("output", []) or []:
+        for content in out.get("content", []) or []:
+            if content.get("type") == "output_text" and content.get("text"):
+                parts.append(content.get("text"))
+    text = "".join(parts).strip()
+    if not text:
+        # Fallback for unexpected response shapes
+        text = (data.get("output_text") or "").strip()
+    if not text:
+        text = _fallback_summary_from_input(ai_input)
+    return text
+
+
+def _render_ai_summary_block(*, cache_path: Path, ai_input: dict) -> None:
+    st.subheader("🤖 AI Summary")
+
+    settings = load_settings()
+    ai_model = settings.get("ai", {}).get("model", "gpt-5-mini")
+
+    cache_basis = {
+        "ai_input": ai_input,
+        "model": ai_model,
+        "max_output_tokens": AI_SUMMARY_MAX_OUTPUT_TOKENS,
+        "system_prompt": AI_SUMMARY_SYSTEM_PROMPT,
+    }
+
+    cached = _load_cached_ai_summary(cache_path)
+    input_hash = _hash_payload(cache_basis)
+    cached_text = None
+    if cached and cached.get("input_hash") == input_hash:
+        cached_text = cached.get("summary")
+
+    auto_key = f"ai_auto_{cache_path.name}_{input_hash[:8]}"
+    summary_text = cached_text
+
+    if not summary_text and not st.session_state.get(auto_key):
+        st.session_state[auto_key] = True
+        try:
+            with st.spinner("Auto-generating AI summary..."):
+                summary_text = _generate_ai_summary_text(ai_input)
+            _save_cached_ai_summary(
+                cache_path,
+                {
+                    "model": ai_model,
+                    "max_output_tokens": AI_SUMMARY_MAX_OUTPUT_TOKENS,
+                    "system_prompt_hash": hashlib.sha256(AI_SUMMARY_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12],
+                    "generated_at": datetime.now().isoformat(),
+                    "input_hash": input_hash,
+                    "summary": summary_text,
+                },
+            )
+            st.experimental_rerun()
+            return
+        except Exception as exc:
+            st.error(str(exc))
+            summary_text = None
+
+    if summary_text:
+        with st.container():
+            st.markdown(summary_text)
+
+    col1, col2, _ = st.columns([1, 1, 2])
+    with col1:
+        label = "Regenerate" if summary_text else "Generate"
+        if st.button(f"✨ {label} summary", use_container_width=True, key=f"gen_{cache_path.name}_{input_hash[:8]}"):
+            st.session_state[auto_key] = False
+            try:
+                with st.spinner("Generating summary..."):
+                    summary_text = _generate_ai_summary_text(ai_input)
+                _save_cached_ai_summary(
+                    cache_path,
+                    {
+                        "model": ai_model,
+                        "max_output_tokens": AI_SUMMARY_MAX_OUTPUT_TOKENS,
+                        "system_prompt_hash": hashlib.sha256(AI_SUMMARY_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12],
+                        "generated_at": datetime.now().isoformat(),
+                        "input_hash": input_hash,
+                        "summary": summary_text,
+                    },
+                )
+                st.experimental_rerun()
+                return
+            except Exception as e:
+                st.error(str(e))
+    with col2:
+        if cached_text and st.button("🧹 Clear", use_container_width=True, key=f"clr_{cache_path.name}_{input_hash[:8]}"):
+            try:
+                cache_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            st.rerun()
+
 # ============================================================================
 # Settings Persistence
 # ============================================================================
@@ -78,7 +376,7 @@ def load_settings() -> dict:
                 saved = json.load(f)
             # Merge with defaults to ensure all keys exist
             settings = DEFAULT_SETTINGS.copy()
-            for section in ["scraper", "ui"]:
+            for section in ["scraper", "ui", "ai"]:
                 if section in saved:
                     settings[section].update(saved[section])
             return settings
@@ -806,6 +1104,28 @@ def render_compiled_overview():
 
     st.markdown("---")
 
+    # AI summary (compiled)
+    search_pairs = []
+    for p in run_paths:
+        kw, loc = _get_run_search_meta(p)
+        if kw or loc:
+            search_pairs.append({"keywords": kw, "location": loc, "run": p.name})
+    ai_input = _build_ai_summary_input(
+        total_jobs=total_jobs,
+        summary=summary,
+        search_context={
+            "runs": [p.name for p in run_paths],
+            "search_terms": search_pairs,
+        },
+        scope_label="compiled",
+        top_n_per_category=AI_SUMMARY_TOP_N_COMPILED,
+    )
+    compiled_key = hashlib.sha256("|".join(sorted(p.name for p in run_paths)).encode("utf-8")).hexdigest()[:16]
+    cache_path = STATE_DIR / f"compiled_ai_summary_{compiled_key}.json"
+    _render_ai_summary_block(cache_path=cache_path, ai_input=ai_input)
+
+    st.markdown("---")
+
     for category_key, category_label in CATEGORY_LABELS.items():
         data = summary.get(category_key, {}) or {}
         if not data:
@@ -981,6 +1301,24 @@ def render_report_overview():
         )
         st.rerun()
     
+    st.markdown("---")
+
+    # AI summary (single report)
+    keywords, location = _get_run_search_meta(run_path)
+    ai_input = _build_ai_summary_input(
+        total_jobs=total_jobs,
+        summary=summary,
+        search_context={
+            "run": run_path.name,
+            "keywords": keywords,
+            "location": location,
+        },
+        scope_label="single",
+        top_n_per_category=AI_SUMMARY_TOP_N_SINGLE,
+    )
+    cache_path = run_path / "ai_summary.json"
+    _render_ai_summary_block(cache_path=cache_path, ai_input=ai_input)
+
     st.markdown("---")
     
     # Category charts in expanders with clickable requirements
@@ -1654,8 +1992,23 @@ def render_settings_page():
     settings = load_settings()
     scraper_settings = settings.get("scraper", {})
     ui_settings = settings.get("ui", {})
+    ai_settings = settings.get("ai", {})
     
     with st.form("settings_form"):
+        st.subheader("AI Settings")
+        
+        ai_model_options = ["gpt-5-mini", "gpt-5.1"]
+        current_model = ai_settings.get("model", "gpt-5-mini")
+        model_index = ai_model_options.index(current_model) if current_model in ai_model_options else 0
+        
+        ai_model = st.selectbox(
+            "AI Model for Summaries",
+            options=ai_model_options,
+            index=model_index,
+            help="Select the OpenAI model to use for generating report summaries"
+        )
+        
+        st.markdown("---")
         st.subheader("Default Search Parameters")
         
         col1, col2 = st.columns(2)
@@ -1755,6 +2108,9 @@ def render_settings_page():
                     "ui": {
                         "default_keywords": default_keywords,
                         "default_location": default_location
+                    },
+                    "ai": {
+                        "model": ai_model
                     }
                 }
                 save_settings(new_settings)
