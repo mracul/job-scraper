@@ -19,6 +19,18 @@ from datetime import datetime
 from collections import defaultdict
 import plotly.express as px
 
+from ui_core import build_ai_summary_input as _ui_build_ai_summary_input
+from ui_core import merge_analyses as _ui_merge_analyses
+
+from compiled_report_store import (
+    build_compiled_report_payload,
+    build_runs_fingerprint,
+    compiled_report_path,
+    is_matching_compiled_report,
+    load_compiled_report,
+    save_compiled_report_atomic,
+)
+
 
 
 
@@ -31,6 +43,8 @@ STATE_DIR = Path(__file__).parent / "state"
 SETTINGS_FILE = STATE_DIR / "ui_settings.json"
 RUN_STATE_FILE = STATE_DIR / "active_run.json"
 LOGS_DIR = Path(__file__).parent / "logs"
+OVERVIEW_DIR = STATE_DIR / "overviews"
+OUTPUTS_DIR = Path(__file__).parent / "outputs"
 
 DEFAULT_SETTINGS = {
     "scraper": {
@@ -143,37 +157,15 @@ def _build_ai_summary_input(
     scope_label: str,
     top_n_per_category: int = 25,
 ) -> dict:
-    """Build payload of tag percentages to feed to the LLM.
-
-    Includes all categories, and the top N items per category. Adds metadata so the LLM can reason
-    about truncation (e.g. when only a subset of terms is included).
-    """
-    categories_payload = {}
-    limit = max(1, int(top_n_per_category))
-    for cat_key, cat_label in CATEGORY_LABELS.items():
-        items = (summary or {}).get(cat_key, {}) or {}
-        top_items = sorted(items.items(), key=lambda t: t[1], reverse=True)[:limit] if items else []
-        categories_payload[cat_key] = {
-            "label": cat_label,
-            "total_unique": len(items),
-            "included": len(top_items),
-            "truncated": len(items) > len(top_items),
-            "top": [
-                {
-                    "term": term,
-                    "count": int(count),
-                    "pct": round((float(count) / float(total_jobs) * 100.0), 1) if total_jobs else 0.0,
-                }
-                for term, count in top_items
-            ],
-        }
-
-    return {
-        "scope": scope_label,
-        "total_jobs": int(total_jobs or 0),
-        "search": search_context,
-        "categories": categories_payload,
-    }
+    # Wrapper kept for backwards compatibility (tests import this symbol).
+    return _ui_build_ai_summary_input(
+        total_jobs=total_jobs,
+        summary=summary,
+        search_context=search_context,
+        scope_label=scope_label,
+        category_labels=CATEGORY_LABELS,
+        top_n_per_category=top_n_per_category,
+    )
 
 
 AI_SUMMARY_SYSTEM_PROMPT = """You are a career coach helping people enter or progress in IT support and help desk roles, using aggregated job market data to guide efficient decision-making.
@@ -235,7 +227,7 @@ Intent
 Your goal is not to prescribe a single path, but to help the reader allocate their time and energy efficiently based on what the market is actually asking for.
 """
 
-AI_SUMMARY_MAX_OUTPUT_TOKENS = 2400
+AI_SUMMARY_MAX_OUTPUT_TOKENS = 4000
 AI_SUMMARY_TOP_N_SINGLE = 50
 AI_SUMMARY_TOP_N_COMPILED = 75
 
@@ -323,7 +315,7 @@ def _generate_ai_summary_text(ai_input: dict) -> str:
     return text
 
 
-def _render_ai_summary_block(*, cache_path: Path, ai_input: dict) -> None:
+def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate: bool = True) -> None:
     st.subheader("🤖 AI Summary")
 
     settings = load_settings()
@@ -343,10 +335,12 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict) -> None:
         cached_text = cached.get("summary")
 
     auto_key = f"ai_auto_{cache_path.name}_{input_hash[:8]}"
+    inflight_key = f"ai_inflight_{cache_path.name}_{input_hash[:8]}"
     summary_text = cached_text
 
-    if not summary_text and not st.session_state.get(auto_key):
+    if auto_generate and (not summary_text) and (not st.session_state.get(auto_key)):
         st.session_state[auto_key] = True
+        st.session_state[inflight_key] = True
         try:
             with st.spinner("Auto-generating AI summary..."):
                 summary_text = _generate_ai_summary_text(ai_input)
@@ -361,45 +355,53 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict) -> None:
                     "summary": summary_text,
                 },
             )
-            st.experimental_rerun()
+            st.session_state[inflight_key] = False
+            st.rerun()
             return
         except Exception as exc:
+            st.session_state[inflight_key] = False
             st.error(str(exc))
             summary_text = None
 
     if summary_text:
-        # Fixed-size, scrollable view
-        st.text_area(
-            "",
-            value=summary_text,
-            height=260,
-            label_visibility="collapsed",
-            key=f"ai_summary_box_{cache_path.name}_{input_hash[:8]}",
-        )
+        # Fixed-size, scrollable view (safe Markdown rendering)
+        # Avoid unsafe HTML injection: render markdown within a height-limited container.
+        try:
+            with st.container(height=260, border=True):
+                st.markdown(summary_text)
+        except TypeError:
+            # Fallback for older Streamlit versions without `height`/`border` params
+            st.markdown(summary_text)
 
-    col1, col2, col3, _ = st.columns([1, 1, 1, 2])
+    col1, col2, col3, _ = st.columns([1.1, 1, 1, 1.9])
     with col1:
         label = "Regenerate" if summary_text else "Generate"
-        if st.button(f"✨ {label} summary", use_container_width=True, key=f"gen_{cache_path.name}_{input_hash[:8]}"):
-            st.session_state[auto_key] = False
-            try:
-                with st.spinner("Generating summary..."):
-                    summary_text = _generate_ai_summary_text(ai_input)
-                _save_cached_ai_summary(
-                    cache_path,
-                    {
-                        "model": ai_model,
-                        "max_output_tokens": AI_SUMMARY_MAX_OUTPUT_TOKENS,
-                        "system_prompt_hash": hashlib.sha256(AI_SUMMARY_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12],
-                        "generated_at": datetime.now().isoformat(),
-                        "input_hash": input_hash,
-                        "summary": summary_text,
-                    },
-                )
-                st.experimental_rerun()
-                return
-            except Exception as e:
-                st.error(str(e))
+        if st.session_state.get(inflight_key):
+            st.spinner("Generating summary...")
+        else:
+            if st.button(f"✨ {label} summary", use_container_width=True, key=f"gen_{cache_path.name}_{input_hash[:8]}"):
+                st.session_state[auto_key] = False
+                st.session_state[inflight_key] = True
+                try:
+                    with st.spinner("Generating summary..."):
+                        summary_text = _generate_ai_summary_text(ai_input)
+                    _save_cached_ai_summary(
+                        cache_path,
+                        {
+                            "model": ai_model,
+                            "max_output_tokens": AI_SUMMARY_MAX_OUTPUT_TOKENS,
+                            "system_prompt_hash": hashlib.sha256(AI_SUMMARY_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12],
+                            "generated_at": datetime.now().isoformat(),
+                            "input_hash": input_hash,
+                            "summary": summary_text,
+                        },
+                    )
+                    st.session_state[inflight_key] = False
+                    st.rerun()
+                    return
+                except Exception as e:
+                    st.session_state[inflight_key] = False
+                    st.error(str(e))
     with col2:
         if cached_text and st.button("🧹 Clear", use_container_width=True, key=f"clr_{cache_path.name}_{input_hash[:8]}"):
             try:
@@ -463,8 +465,33 @@ def _read_run_state_raw() -> dict | None:
 def save_run_state(pid: int, log_file: str) -> None:
     """Persist running process info to disk."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    create_time = None
+    cmdline: list[str] | None = None
+    try:
+        import psutil
+
+        proc = psutil.Process(pid)
+        try:
+            create_time = float(proc.create_time())
+        except Exception:
+            create_time = None
+        try:
+            cmdline = [str(x) for x in (proc.cmdline() or [])]
+        except Exception:
+            cmdline = None
+    except Exception:
+        create_time = None
+        cmdline = None
+
+    payload = {
+        "pid": pid,
+        "log_file": log_file,
+        "started": datetime.now().isoformat(),
+        "create_time": create_time,
+        "cmd": cmdline,
+    }
     with open(RUN_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"pid": pid, "log_file": log_file, "started": datetime.now().isoformat()}, f)
+        json.dump(payload, f)
 
 
 def clear_run_state() -> None:
@@ -482,16 +509,32 @@ def load_run_state() -> dict | None:
     if pid:
         import psutil
         if psutil.pid_exists(pid):
+            # Protect against PID reuse by verifying create_time when available.
+            try:
+                proc = psutil.Process(int(pid))
+                stored_ct = data.get("create_time")
+                if stored_ct is not None:
+                    try:
+                        stored_ct_f = float(stored_ct)
+                        live_ct_f = float(proc.create_time())
+                        # create_time is in seconds since epoch; allow small clock/float tolerance.
+                        if abs(live_ct_f - stored_ct_f) > 2.0:
+                            return None
+                    except Exception:
+                        # If parsing fails, fall back to liveness only.
+                        pass
+            except Exception:
+                # If we can't inspect the process, fall back to pid_exists.
+                pass
+
             return data
     return None
 
 
 def _find_latest_run_after(started_at: datetime | None) -> Path | None:
-    """Best-effort: find newest report folder created after a given start time."""
+    """Find the newest report folder (assumes the latest is the one just completed)."""
     if not SCRAPED_DATA_DIR.exists():
         return None
-    started_ts = started_at.timestamp() if started_at else None
-
     candidates: list[tuple[float, Path]] = []
     for folder in SCRAPED_DATA_DIR.iterdir():
         if not folder.is_dir():
@@ -499,8 +542,6 @@ def _find_latest_run_after(started_at: datetime | None) -> Path | None:
         try:
             mtime = folder.stat().st_mtime
         except Exception:
-            continue
-        if started_ts is not None and mtime < (started_ts - 60):
             continue
         candidates.append((mtime, folder))
 
@@ -514,6 +555,7 @@ def _find_latest_run_after(started_at: datetime | None) -> Path | None:
 # Data Loading Utilities
 # ============================================================================
 
+@st.cache_data(ttl=30)
 def list_runs() -> list[dict]:
     """List all scraping runs with metadata, newest first."""
     if not SCRAPED_DATA_DIR.exists():
@@ -577,14 +619,34 @@ def list_runs() -> list[dict]:
     return runs
 
 
+@st.cache_data
+def _load_analysis_cached(analysis_file: str, mtime: float) -> dict | None:
+    """Cached JSON loader keyed on (path, mtime) to avoid stale UI data."""
+    try:
+        with open(analysis_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def load_analysis(run_path: Path) -> dict | None:
     """Load requirements_analysis.json for a run."""
     analysis_file = run_path / "requirements_analysis.json"
     if not analysis_file.exists():
         return None
     try:
-        with open(analysis_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+        mtime = float(analysis_file.stat().st_mtime)
+    except Exception:
+        mtime = 0.0
+    return _load_analysis_cached(str(analysis_file), mtime)
+
+
+@st.cache_data
+def _load_jobs_csv_cached(csv_file: str, mtime: float) -> pd.DataFrame | None:
+    """Cached CSV loader keyed on (path, mtime) to avoid stale UI data."""
+    try:
+        return pd.read_csv(csv_file)
     except Exception:
         return None
 
@@ -595,9 +657,10 @@ def load_jobs_csv(run_path: Path) -> pd.DataFrame | None:
     if not csv_file.exists():
         return None
     try:
-        return pd.read_csv(csv_file)
+        mtime = float(csv_file.stat().st_mtime)
     except Exception:
-        return None
+        mtime = 0.0
+    return _load_jobs_csv_cached(str(csv_file), mtime)
 
 
 # ============================================================================
@@ -637,6 +700,357 @@ def init_session_state():
     if "nav_origin" not in st.session_state:
         # Used to control where "Back" returns (e.g. compiled overview).
         st.session_state.nav_origin = None
+    if "overview_params" not in st.session_state:
+        st.session_state.overview_params = None
+    if "overview_cache_path" not in st.session_state:
+        st.session_state.overview_cache_path = None
+    if "overview_notice" not in st.session_state:
+        st.session_state.overview_notice = None
+
+
+def _overview_params(cutoff_days: int, half_life_days: int, top_n: int) -> dict:
+    return {
+        "cutoff_days": int(cutoff_days),
+        "half_life_days": int(half_life_days),
+        "top_n": int(top_n),
+    }
+
+
+def _overview_cache_file(params: dict) -> Path:
+    OVERVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    key = _hash_payload({"overview": params})[:16]
+    return OVERVIEW_DIR / f"overview_{key}.json"
+
+
+def _load_overview_cache(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _save_overview_cache(path: Path, data: dict) -> None:
+    OVERVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _export_overview_files(*, payload: dict, params: dict) -> dict[str, str]:
+    """Export overview artifacts to outputs/.
+
+    Writes:
+    - overview_<key>.json (full cached payload, plus AI summary text if available)
+    - overview_<key>_series.csv (trend series)
+    - overview_<key>.md (human-readable summary)
+    """
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    key = _hash_payload({"overview": params})[:16]
+    json_path = OUTPUTS_DIR / f"overview_{key}.json"
+    csv_path = OUTPUTS_DIR / f"overview_{key}_series.csv"
+    md_path = OUTPUTS_DIR / f"overview_{key}.md"
+
+    # Best-effort: include AI summary (if already generated)
+    ai_cache = OVERVIEW_DIR / f"ai_{_hash_payload(params)[:16]}.json"
+    ai_text: str | None = None
+    cached_ai = _load_cached_ai_summary(ai_cache)
+    if cached_ai and isinstance(cached_ai.get("summary"), str):
+        ai_text = cached_ai.get("summary")
+
+    export_payload = dict(payload)
+    export_payload["ai_summary"] = ai_text
+    export_payload["exported_at"] = datetime.now().isoformat()
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(export_payload, f, indent=2, ensure_ascii=False)
+
+    # CSV series
+    series = payload.get("series")
+    if isinstance(series, list) and series:
+        df = pd.DataFrame(series)
+        # Ensure stable column order
+        cols = [
+            c
+            for c in ["timestamp", "run", "run_order", "category", "term", "count", "pct", "total_jobs"]
+            if c in df.columns
+        ]
+        if cols:
+            df = df[cols]
+        df.to_csv(csv_path, index=False)
+    else:
+        # Still create an empty CSV so exports are predictable
+        pd.DataFrame(columns=["timestamp", "run", "run_order", "category", "term", "count", "pct", "total_jobs"]).to_csv(
+            csv_path, index=False
+        )
+
+    # Markdown report
+    meta = payload.get("meta") or {}
+    runs_used = payload.get("runs") or []
+    runs_count = len(runs_used) if isinstance(runs_used, list) else 0
+    raw_jobs = int(meta.get("raw_jobs", 0) or 0)
+    effective_jobs = float(meta.get("effective_jobs", 0) or 0)
+    cutoff_days = meta.get("cutoff_days", "N/A")
+    half_life_days = meta.get("half_life_days", "N/A")
+    min_ts = meta.get("min_ts", "")
+    max_ts = meta.get("max_ts", "")
+    top_n = params.get("top_n", 10)
+
+    lines: list[str] = []
+    lines.append("# Job Market Overview (Weighted)")
+    lines.append("")
+    lines.append(f"**Cutoff:** {cutoff_days} days  ")
+    lines.append(f"**Half-life:** {half_life_days} days  ")
+    lines.append(f"**Top N terms/category:** {top_n}  ")
+    lines.append(f"**Generated:** {payload.get('generated_at')}")
+    lines.append("")
+    lines.append("## Window Summary")
+    lines.append("")
+    lines.append(f"- Runs included: {runs_count}")
+    lines.append(f"- Raw jobs scanned: {raw_jobs:,}")
+    lines.append(f"- Effective jobs (weighted): {effective_jobs:,.1f}")
+    if min_ts and max_ts:
+        lines.append(f"- Window span: {min_ts[:10]} → {max_ts[:10]}")
+    lines.append("")
+
+    if isinstance(runs_used, list) and runs_used:
+        lines.append("## Runs")
+        lines.append("")
+        for r in runs_used:
+            name = r.get("name")
+            ts = r.get("timestamp", "")[:10] if r.get("timestamp") else ""
+            jobs = r.get("total_jobs") or r.get("job_count")
+            weight = r.get("weight", 1.0)
+            lines.append(f"- {name} ({jobs} jobs, weight: {weight:.3f}) — {ts}")
+        lines.append("")
+
+    # Weighted summary by category
+    weighted_summary = payload.get("weighted_summary") or {}
+    top_terms = payload.get("top_terms") or {}
+    if weighted_summary:
+        lines.append("## Weighted Summary")
+        lines.append("")
+        for cat_key, cat_label in CATEGORY_LABELS.items():
+            terms = top_terms.get(cat_key, [])
+            if not terms:
+                continue
+            cat_data = weighted_summary.get(cat_key, {})
+            lines.append(f"### {cat_label}")
+            lines.append("")
+            lines.append("| Term | Weighted % | Weighted Count |")
+            lines.append("|------|------------|----------------|")
+            for term in terms:
+                item = cat_data.get(term, {})
+                w_pct = item.get("weighted_pct", 0)
+                w_count = item.get("weighted_count", 0)
+                lines.append(f"| {term} | {w_pct:.1f}% | {w_count:.1f} |")
+            lines.append("")
+
+    lines.append("## AI Summary")
+    lines.append("")
+    if ai_text:
+        lines.append(ai_text.strip())
+    else:
+        lines.append("_AI summary not generated yet. Generate it from the Overview page, then export again._")
+    lines.append("")
+
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+
+    return {"json": str(json_path), "csv": str(csv_path), "md": str(md_path)}
+
+
+def _runs_within_cutoff(runs: list[dict], cutoff_days: int) -> list[dict]:
+    """Filter runs to those within cutoff_days of the most recent run."""
+    if not runs:
+        return []
+    # Find t_ref = max timestamp among runs
+    timestamps = []
+    for r in runs:
+        ts = r.get("timestamp")
+        if isinstance(ts, datetime):
+            timestamps.append(ts.timestamp())
+    if not timestamps:
+        return runs
+    t_ref = max(timestamps)
+    cutoff_ts = t_ref - (cutoff_days * 86400)
+    selected = []
+    for r in runs:
+        ts = r.get("timestamp")
+        if isinstance(ts, datetime):
+            if ts.timestamp() >= cutoff_ts:
+                selected.append(r)
+    return selected
+
+
+def _compute_run_weight(run_ts: datetime, t_ref: float, half_life_days: float) -> float:
+    """Compute weight using half-life decay: w_i = 2^(-delta_i / H)."""
+    delta_days = (t_ref - run_ts.timestamp()) / 86400.0
+    return 2.0 ** (-delta_days / half_life_days)
+
+
+def _build_overview_payload(*, runs: list[dict], cutoff_days: int, half_life_days: int, top_n: int) -> dict:
+    """Build overview payload with weighted merge using half-life decay model.
+    
+    Weight formula: w_i = 2^(-delta_i / H)
+    where delta_i = age in days from t_ref, H = half_life_days
+    """
+    usable_runs: list[dict] = []
+    analyses: list[dict] = []
+    run_timestamps: list[float] = []
+
+    for r in runs:
+        run_path = Path(r.get("path"))
+        analysis = load_analysis(run_path)
+        if not analysis:
+            continue
+        total_jobs = int(analysis.get("total_jobs", 0) or 0)
+        summary = analysis.get("summary", {}) or {}
+        if not isinstance(summary, dict) or (not summary):
+            continue
+        run_ts = r.get("timestamp")
+        if not isinstance(run_ts, datetime):
+            continue
+        run_timestamps.append(run_ts.timestamp())
+        usable_runs.append(
+            {
+                "name": str(r.get("name") or run_path.name),
+                "path": str(run_path),
+                "timestamp": run_ts.isoformat(),
+                "job_count": int(r.get("job_count", total_jobs) or total_jobs),
+                "total_jobs": total_jobs,
+            }
+        )
+        analyses.append({"total_jobs": total_jobs, "summary": summary, "timestamp": run_ts})
+
+    if not usable_runs:
+        return {
+            "generated_at": datetime.now().isoformat(),
+            "runs": [],
+            "meta": {
+                "cutoff_days": cutoff_days,
+                "half_life_days": half_life_days,
+                "raw_jobs": 0,
+                "effective_jobs": 0.0,
+                "min_ts": None,
+                "max_ts": None,
+            },
+            "weighted_summary": {},
+            "top_terms": {},
+            "series": [],
+        }
+
+    # t_ref = max timestamp among usable runs
+    t_ref = max(run_timestamps)
+    t_ref_dt = datetime.fromtimestamp(t_ref)
+    min_ts = min(run_timestamps)
+    min_ts_dt = datetime.fromtimestamp(min_ts)
+
+    # Compute weights and weighted merge
+    raw_jobs = 0
+    effective_jobs = 0.0
+    weighted_counts: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+
+    for analysis in analyses:
+        run_ts = analysis["timestamp"]
+        total_jobs = analysis["total_jobs"]
+        summary = analysis["summary"]
+        weight = _compute_run_weight(run_ts, t_ref, half_life_days)
+
+        raw_jobs += total_jobs
+        effective_jobs += weight * total_jobs
+
+        for cat_key in CATEGORY_LABELS.keys():
+            cat_map = summary.get(cat_key, {}) or {}
+            if not isinstance(cat_map, dict):
+                continue
+            for term, count in cat_map.items():
+                try:
+                    c = int(count or 0)
+                except (ValueError, TypeError):
+                    c = 0
+                weighted_counts[cat_key][term] += weight * c
+
+    # Build weighted summary (weighted_pct = weighted_count / effective_jobs)
+    weighted_summary: dict[str, dict[str, dict]] = {}
+    for cat_key, terms_map in weighted_counts.items():
+        weighted_summary[cat_key] = {}
+        for term, w_count in terms_map.items():
+            w_pct = (w_count / effective_jobs * 100.0) if effective_jobs > 0 else 0.0
+            weighted_summary[cat_key][term] = {
+                "weighted_count": round(w_count, 2),
+                "weighted_pct": round(w_pct, 2),
+            }
+
+    # Decide top-N terms per category by weighted count
+    top_terms_by_cat: dict[str, list[str]] = {}
+    limit = max(1, int(top_n))
+    for cat_key in CATEGORY_LABELS.keys():
+        items = weighted_summary.get(cat_key, {})
+        if not items:
+            top_terms_by_cat[cat_key] = []
+            continue
+        ranked = sorted(items.items(), key=lambda t: t[1].get("weighted_count", 0), reverse=True)
+        top_terms_by_cat[cat_key] = [str(term) for term, _ in ranked[:limit]]
+
+    # Add weights to usable_runs for reference
+    for r in usable_runs:
+        ts_str = r.get("timestamp")
+        if ts_str:
+            try:
+                run_dt = datetime.fromisoformat(ts_str)
+                r["weight"] = round(_compute_run_weight(run_dt, t_ref, half_life_days), 4)
+            except Exception:
+                r["weight"] = 1.0
+
+    # Build per-run time series (for delta computation and heatmaps)
+    per_run_rows: list[dict] = []
+    for idx, r in enumerate(usable_runs):
+        run_path = Path(r["path"])
+        analysis = load_analysis(run_path) or {}
+        total_jobs = int(analysis.get("total_jobs", 0) or 0)
+        summary = analysis.get("summary", {}) or {}
+        run_ts_str = r.get("timestamp")
+        run_label = r["name"]
+        run_order = idx
+
+        for cat_key, terms in top_terms_by_cat.items():
+            cat_map = (summary.get(cat_key, {}) or {}) if isinstance(summary, dict) else {}
+            if not isinstance(cat_map, dict):
+                continue
+            for term in terms:
+                count = int(cat_map.get(term, 0) or 0)
+                pct = round((float(count) / float(total_jobs) * 100.0), 2) if total_jobs else 0.0
+                per_run_rows.append(
+                    {
+                        "category": cat_key,
+                        "term": term,
+                        "run": run_label,
+                        "run_order": run_order,
+                        "timestamp": run_ts_str,
+                        "count": count,
+                        "pct": pct,
+                        "total_jobs": total_jobs,
+                    }
+                )
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "runs": usable_runs,
+        "meta": {
+            "cutoff_days": cutoff_days,
+            "half_life_days": half_life_days,
+            "raw_jobs": raw_jobs,
+            "effective_jobs": round(effective_jobs, 2),
+            "min_ts": min_ts_dt.isoformat(),
+            "max_ts": t_ref_dt.isoformat(),
+        },
+        "weighted_summary": weighted_summary,
+        "top_terms": top_terms_by_cat,
+        "series": per_run_rows,
+    }
 
 
 def _get_query_params() -> dict:
@@ -782,16 +1196,95 @@ def _sync_url_with_state() -> None:
         _set_query_params(desired)
 
 
+def _clear_report_filter_widgets() -> None:
+    """Clear Streamlit widget keys used by the Job Explorer filters.
+
+    This prevents stale widget state bleeding across run switches or view transitions.
+    """
+    for widget_key in FILTER_WIDGET_KEYS:
+        st.session_state.pop(widget_key, None)
+    # Separate widget key used for the explorer match-mode radio.
+    st.session_state.pop("filter_mode_radio", None)
+
+
+def _normalize_navigation_state() -> None:
+    """Coerce session state into a consistent navigation state.
+
+    Streamlit reruns + URL sync can leave stale combinations (e.g. job_detail with no
+    job id). Normalizing prevents incorrect components rendering.
+    """
+    page = st.session_state.get("page") or "reports"
+    st.session_state.page = page
+
+    # Non-reports pages should never keep report/explorer sub-state.
+    if page != "reports":
+        st.session_state.selected_run = None
+        st.session_state.view_mode = "overview"
+        st.session_state.viewing_job_id = None
+        st.session_state.selected_filters = {}
+        st.session_state.filter_mode = "any"
+        st.session_state.search_text = ""
+        _clear_report_filter_widgets()
+        return
+
+    # Reports page: validate view_mode.
+    view_mode = st.session_state.get("view_mode") or "overview"
+    allowed = {"overview", "explorer", "job_detail", "compiled_overview"}
+    if view_mode not in allowed:
+        view_mode = "overview"
+    st.session_state.view_mode = view_mode
+
+    selected_run = st.session_state.get("selected_run")
+
+    # Views that require a run.
+    if view_mode in {"overview", "explorer", "job_detail"} and not selected_run:
+        st.session_state.view_mode = "overview"
+        st.session_state.viewing_job_id = None
+        st.session_state.selected_filters = {}
+        st.session_state.filter_mode = "any"
+        st.session_state.search_text = ""
+        _clear_report_filter_widgets()
+        return
+
+    # Explorer: never keep a selected job.
+    if st.session_state.view_mode == "explorer":
+        st.session_state.viewing_job_id = None
+
+    # Job detail requires a job id.
+    if st.session_state.view_mode == "job_detail":
+        job_id = st.session_state.get("viewing_job_id")
+        if not isinstance(job_id, int) or job_id <= 0:
+            st.session_state.view_mode = "overview"
+            st.session_state.viewing_job_id = None
+
+    # Non-job detail views should not keep a job id.
+    if st.session_state.view_mode != "job_detail":
+        st.session_state.viewing_job_id = None
+
+
 def navigate_to(page: str, **kwargs):
     """Navigate to a page with optional state updates, syncing state to URL."""
+    prev_selected_run = st.session_state.get("selected_run")
+
     st.session_state.page = page
     for key, value in kwargs.items():
         st.session_state[key] = value
 
-    if "selected_filters" in kwargs:
-        for widget_key in FILTER_WIDGET_KEYS:
-            st.session_state.pop(widget_key, None)
+    # If the run changes (or filters are explicitly set), clear explorer widget state
+    # so widgets don't retain invalid selections across runs.
+    if "selected_run" in kwargs and kwargs.get("selected_run") != prev_selected_run:
+        if "selected_filters" not in kwargs:
+            st.session_state.selected_filters = {}
+        if "filter_mode" not in kwargs:
+            st.session_state.filter_mode = "any"
+        if "search_text" not in kwargs:
+            st.session_state.search_text = ""
+        _clear_report_filter_widgets()
 
+    if "selected_filters" in kwargs:
+        _clear_report_filter_widgets()
+
+    _normalize_navigation_state()
     _sync_url_with_state()
 
 
@@ -816,9 +1309,18 @@ def render_sidebar():
                 navigate_to("new_run")
                 st.rerun()
             st.markdown("---")
+        else:
+            # Quick stats
+            runs = list_runs()
+            st.caption(f"📊 {len(runs)} report(s) available")
+            
+            if runs:
+                total_jobs = sum(r["job_count"] for r in runs)
+                st.caption(f"📋 {total_jobs} total jobs scraped")
         
         # Navigation
         nav_options = {
+            "overview": "📈 Overview",
             "reports": "📂 Reports",
             "new_run": "🚀 New Run",
             "settings": "⚙️ Settings"
@@ -842,75 +1344,91 @@ def render_sidebar():
                 st.rerun()
         
         st.markdown("---")
-        
-        # Quick stats
-        runs = list_runs()
-        st.caption(f"📊 {len(runs)} report(s) available")
-        
-        if runs:
-            total_jobs = sum(r["job_count"] for r in runs)
-            st.caption(f"📋 {total_jobs} total jobs scraped")
 
 
 def render_breadcrumb():
-    """Render breadcrumb navigation based on current state."""
-    parts = []
-    
+    """Render breadcrumb navigation using pills for consistent clickable trail."""
+    crumbs: list[tuple[str, dict]] = []  # (label, nav_kwargs)
+
     if st.session_state.page == "reports":
-        parts.append("Reports")
+        crumbs.append(("📂 Reports", {
+            "selected_run": None,
+            "view_mode": "overview",
+            "viewing_job_id": None,
+            "selected_filters": {},
+            "filter_mode": "any",
+            "search_text": "",
+            "compiled_runs": [],
+        }))
+
         if st.session_state.view_mode == "compiled_overview":
-            parts.append("Compiled Review")
+            crumbs.append(("Compiled Review", {"view_mode": "compiled_overview"}))
         elif st.session_state.selected_run:
             run_name = Path(st.session_state.selected_run).name
-            parts.append(run_name[:30] + "..." if len(run_name) > 30 else run_name)
+            run_label = run_name[:25] + "…" if len(run_name) > 25 else run_name
+            crumbs.append((run_label, {
+                "selected_run": st.session_state.selected_run,
+                "view_mode": "overview",
+                "viewing_job_id": None,
+                "selected_filters": {},
+                "filter_mode": "any",
+                "search_text": "",
+            }))
+
             if st.session_state.view_mode == "explorer":
-                parts.append("Job Explorer")
+                crumbs.append(("Jobs", {
+                    "selected_run": st.session_state.selected_run,
+                    "view_mode": "explorer",
+                    "viewing_job_id": None,
+                }))
             elif st.session_state.view_mode == "job_detail":
-                parts.append("Job Detail")
+                crumbs.append(("Jobs", {
+                    "selected_run": st.session_state.selected_run,
+                    "view_mode": "explorer",
+                    "viewing_job_id": None,
+                }))
+                crumbs.append(("Detail", {
+                    "selected_run": st.session_state.selected_run,
+                    "view_mode": "job_detail",
+                    "viewing_job_id": st.session_state.viewing_job_id,
+                }))
     elif st.session_state.page == "new_run":
-        parts.append("New Run")
+        crumbs.append(("🚀 New Run", {}))
     elif st.session_state.page == "settings":
-        parts.append("Settings")
-    
-    st.caption(" > ".join(parts))
+        crumbs.append(("⚙️ Settings", {}))
+    elif st.session_state.page == "overview":
+        crumbs.append(("📈 Overview", {}))
 
+    if not crumbs:
+        return
 
-def render_back_button():
-    """Render a back button based on current navigation state."""
-    if st.session_state.view_mode == "job_detail":
-        if st.button("← Back to Job List", key="back_from_detail"):
-            st.session_state.view_mode = "explorer"
-            st.session_state.viewing_job_id = None
-            _sync_url_with_state()
-            st.rerun()
-    elif st.session_state.view_mode == "explorer":
-        if st.button("← Back to Overview", key="back_from_explorer"):
-            # If user drilled in from compiled overview, return there.
-            if st.session_state.get("nav_origin") == "compiled":
-                st.session_state.selected_run = None
-                st.session_state.view_mode = "compiled_overview"
-                st.session_state.viewing_job_id = None
-                st.session_state.nav_origin = None
-            else:
-                st.session_state.view_mode = "overview"
-                st.session_state.viewing_job_id = None
-            _sync_url_with_state()
-            st.rerun()
-    elif st.session_state.view_mode == "compiled_overview":
-        if st.button("← Back to Report List", key="back_from_compiled"):
-            st.session_state.selected_run = None
-            st.session_state.view_mode = "overview"
-            st.session_state.viewing_job_id = None
-            st.session_state.compiled_runs = []
-            _sync_url_with_state()
-            st.rerun()
-    elif st.session_state.selected_run and st.session_state.view_mode == "overview":
-        if st.button("← Back to Report List", key="back_from_overview"):
-            st.session_state.selected_run = None
-            st.session_state.view_mode = "overview"
-            st.session_state.viewing_job_id = None
-            _sync_url_with_state()
-            st.rerun()
+    labels = [c[0] for c in crumbs]
+    current_idx = len(crumbs) - 1  # Last crumb is current location
+
+    # `st.pills` is not available in all Streamlit versions.
+    if hasattr(st, "pills"):
+        selected = st.pills(
+            "nav",
+            labels,
+            default=labels[current_idx],
+            key="breadcrumb_pills",
+            label_visibility="collapsed",
+        )
+    else:
+        selected = st.selectbox(
+            "nav",
+            labels,
+            index=current_idx,
+            key="breadcrumb_select",
+            label_visibility="collapsed",
+        )
+
+    # Navigate if user clicked a different crumb
+    if selected and selected != labels[current_idx]:
+        clicked_idx = labels.index(selected)
+        nav_kwargs = crumbs[clicked_idx][1]
+        navigate_to("reports", **nav_kwargs)
+        st.rerun()
 
 
 # ============================================================================
@@ -919,15 +1437,14 @@ def render_back_button():
 
 def render_reports_page():
     """Render the reports page."""
+    _normalize_navigation_state()
     render_breadcrumb()
-    
+
     if st.session_state.view_mode == "compiled_overview":
-        render_back_button()
         render_compiled_overview()
         return
 
     if st.session_state.selected_run:
-        render_back_button()
         if st.session_state.view_mode == "job_detail":
             render_job_detail_view()
         elif st.session_state.view_mode == "explorer":
@@ -936,6 +1453,399 @@ def render_reports_page():
             render_report_overview()
     else:
         render_report_list()
+
+
+# ============================================================================
+# Page: Overview
+# ============================================================================
+
+CUTOFF_PRESETS = [
+    ("7d", 7),
+    ("30d", 30),
+    ("90d", 90),
+    ("180d", 180),
+    ("365d", 365),
+]
+CUTOFF_LABELS = [label for label, _ in CUTOFF_PRESETS]
+CUTOFF_VALUES = {label: value for label, value in CUTOFF_PRESETS}
+
+HALFLIFE_PRESETS = [
+    ("7d", 7),
+    ("14d", 14),
+    ("30d", 30),
+    ("60d", 60),
+    ("90d", 90),
+]
+HALFLIFE_LABELS = [label for label, _ in HALFLIFE_PRESETS]
+HALFLIFE_VALUES = {label: value for label, value in HALFLIFE_PRESETS}
+
+
+def _compute_delta_vs_prev(series: list[dict], cat_key: str, term: str) -> str | None:
+    """Compute delta (pp) between latest and previous run for a term."""
+    cat_rows = [r for r in series if r.get("category") == cat_key and r.get("term") == term]
+    if len(cat_rows) < 2:
+        return None
+    # Sort by run_order (or timestamp) descending
+    cat_rows_sorted = sorted(cat_rows, key=lambda x: x.get("run_order", 0), reverse=True)
+    latest_pct = cat_rows_sorted[0].get("pct", 0)
+    prev_pct = cat_rows_sorted[1].get("pct", 0)
+    delta = latest_pct - prev_pct
+    if abs(delta) < 0.5:
+        return "→"
+    elif delta > 0:
+        return f"↑ +{delta:.1f}pp"
+    else:
+        return f"↓ {delta:.1f}pp"
+
+
+def _render_market_context_bars(weighted_summary: dict, effective_jobs: float) -> None:
+    """Render market context (support levels + work arrangements) as progress bars."""
+    st.subheader("📊 Market Context")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**Support Levels**")
+        support_data = weighted_summary.get("support_levels", {})
+        if support_data:
+            # Sort by weighted_pct descending
+            sorted_items = sorted(support_data.items(), key=lambda x: x[1].get("weighted_pct", 0), reverse=True)
+            for term, data in sorted_items[:6]:
+                pct = data.get("weighted_pct", 0)
+                st.progress(min(pct / 100.0, 1.0), text=f"{term}: {pct:.1f}%")
+        else:
+            st.caption("No support level data available.")
+
+    with col2:
+        st.markdown("**Work Arrangements**")
+        work_data = weighted_summary.get("work_arrangements", {})
+        if work_data:
+            sorted_items = sorted(work_data.items(), key=lambda x: x[1].get("weighted_pct", 0), reverse=True)
+            for term, data in sorted_items[:6]:
+                pct = data.get("weighted_pct", 0)
+                st.progress(min(pct / 100.0, 1.0), text=f"{term}: {pct:.1f}%")
+        else:
+            st.caption("No work arrangement data available.")
+
+
+def _render_category_snapshot(cat_key: str, cat_label: str, weighted_summary: dict, top_terms: list[str], series: list[dict]) -> None:
+    """Render a category as a snapshot table with view toggle."""
+    cat_data = weighted_summary.get(cat_key, {})
+    if not cat_data or not top_terms:
+        return
+
+    with st.expander(cat_label, expanded=False):
+        # View toggle
+        view_key = f"view_mode_{cat_key}"
+        if view_key not in st.session_state:
+            st.session_state[view_key] = "Snapshot"
+
+        view_options = ["Snapshot", "Heatmap", "Advanced"]
+        cols = st.columns([1, 1, 1, 3])
+        for i, opt in enumerate(view_options):
+            with cols[i]:
+                if st.button(opt, key=f"{cat_key}_{opt}", use_container_width=True,
+                           type="primary" if st.session_state[view_key] == opt else "secondary"):
+                    st.session_state[view_key] = opt
+                    st.rerun()
+
+        view_mode = st.session_state[view_key]
+
+        if view_mode == "Snapshot":
+            # Snapshot table
+            table_data = []
+            for term in top_terms:
+                item = cat_data.get(term, {})
+                w_pct = item.get("weighted_pct", 0)
+                w_count = item.get("weighted_count", 0)
+                delta = _compute_delta_vs_prev(series, cat_key, term)
+                table_data.append({
+                    "Term": term,
+                    "Weighted %": f"{w_pct:.1f}%",
+                    "W.Count": f"{w_count:.1f}",
+                    "Δ vs prev": delta or "—",
+                })
+            df_table = pd.DataFrame(table_data)
+            st.dataframe(df_table, use_container_width=True, hide_index=True)
+            st.caption(f"Top {len(top_terms)} shown by weighted count.")
+
+        elif view_mode == "Heatmap":
+            # Heatmap view using series data
+            cat_series = [r for r in series if r.get("category") == cat_key and r.get("term") in top_terms]
+            if cat_series:
+                df_heat = pd.DataFrame(cat_series)
+                # Pivot: rows=term, cols=run, values=pct
+                try:
+                    pivot = df_heat.pivot(index="term", columns="run", values="pct").fillna(0)
+                    fig = px.imshow(
+                        pivot,
+                        labels=dict(x="Run", y="Term", color="% of jobs"),
+                        aspect="auto",
+                        color_continuous_scale="Blues",
+                    )
+                    fig.update_layout(margin=dict(l=10, r=10, t=20, b=10), height=max(200, len(top_terms) * 25))
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception:
+                    st.info("Unable to render heatmap.")
+            else:
+                st.info("No series data for heatmap.")
+
+        else:  # Advanced (line chart)
+            cat_series = [r for r in series if r.get("category") == cat_key and r.get("term") in top_terms]
+            if cat_series:
+                df_line = pd.DataFrame(cat_series)
+                has_ts = "timestamp" in df_line.columns and df_line["timestamp"].notna().any()
+                x_col = "timestamp" if has_ts else "run_order"
+                try:
+                    df_line = df_line.sort_values(by=[x_col, "term"], ascending=True)
+                except Exception:
+                    pass
+                fig = px.line(
+                    df_line,
+                    x=x_col,
+                    y="pct",
+                    color="term",
+                    markers=True,
+                    labels={"pct": "% of jobs"},
+                )
+                fig.update_layout(
+                    legend_title_text="Term",
+                    margin=dict(l=10, r=10, t=20, b=10),
+                    height=360,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No series data for chart.")
+
+
+def render_overview_page():
+    """Render weighted statistical overview across runs."""
+    render_breadcrumb()
+    st.header("📈 Overview")
+
+    runs = list_runs()
+    if not runs:
+        st.info("No reports found yet. Start a new run to generate data.")
+        return
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Controls
+    # ─────────────────────────────────────────────────────────────────────────
+    col1, col2, col3 = st.columns([1.2, 1.2, 0.8])
+    with col1:
+        cutoff_choice = st.selectbox(
+            "Cutoff",
+            options=CUTOFF_LABELS,
+            index=3,  # Default: 180d
+            help="Include runs from the last N days (relative to most recent run).",
+        )
+    with col2:
+        halflife_choice = st.selectbox(
+            "Half-life",
+            options=HALFLIFE_LABELS,
+            index=2,  # Default: 30d
+            help="Weight decay half-life. Older runs contribute less; halved every H days.",
+        )
+    with col3:
+        top_n = st.number_input(
+            "Top N",
+            min_value=3,
+            max_value=50,
+            value=10,
+            step=1,
+            help="Show top N terms per category by weighted count.",
+        )
+
+    cutoff_days = CUTOFF_VALUES[cutoff_choice]
+    half_life_days = HALFLIFE_VALUES[halflife_choice]
+
+    btn_col1, btn_col2 = st.columns([1, 1])
+    with btn_col1:
+        generate = st.button("🔄 Generate / Update", type="primary", use_container_width=True)
+    with btn_col2:
+        params = _overview_params(cutoff_days, half_life_days, int(top_n))
+        cache_file = _overview_cache_file(params)
+        cached = _load_overview_cache(cache_file)
+        export_disabled = (not cached) or (cached.get("params") != params)
+        export_now = st.button(
+            "💾 Export files",
+            disabled=export_disabled,
+            use_container_width=True,
+            help="Writes JSON + CSV + Markdown to outputs/.",
+        )
+
+    # One-shot notices
+    notice = st.session_state.get("overview_notice")
+    if isinstance(notice, str) and notice:
+        st.success(notice)
+        st.session_state.overview_notice = None
+
+    if generate:
+        selected_runs = _runs_within_cutoff(runs, cutoff_days)
+        payload = _build_overview_payload(
+            runs=selected_runs,
+            cutoff_days=cutoff_days,
+            half_life_days=half_life_days,
+            top_n=int(top_n),
+        )
+        payload["params"] = params
+        _save_overview_cache(cache_file, payload)
+        exported = _export_overview_files(payload=payload, params=params)
+        st.session_state.overview_notice = (
+            f"Exported: {Path(exported['md']).name}, {Path(exported['csv']).name}, {Path(exported['json']).name}"
+        )
+        st.session_state.overview_params = params
+        st.session_state.overview_cache_path = str(cache_file)
+        st.rerun()
+        return
+
+    if export_now and cached and cached.get("params") == params:
+        exported = _export_overview_files(payload=cached, params=params)
+        st.session_state.overview_notice = (
+            f"Exported: {Path(exported['md']).name}, {Path(exported['csv']).name}, {Path(exported['json']).name}"
+        )
+        st.rerun()
+        return
+
+    # Validate cache
+    if not cached or cached.get("params") != params:
+        st.caption("Overview not generated for these settings yet. Click **Generate / Update**.")
+        st.stop()
+
+    meta = cached.get("meta") or {}
+    runs_used = cached.get("runs") or []
+    weighted_summary = cached.get("weighted_summary") or {}
+    top_terms = cached.get("top_terms") or {}
+    series = cached.get("series") or []
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Model explanation (UX copy)
+    # ─────────────────────────────────────────────────────────────────────────
+    max_ts = meta.get("max_ts", "")
+    cutoff_date_str = ""
+    if max_ts:
+        try:
+            max_dt = datetime.fromisoformat(max_ts)
+            cutoff_dt = max_dt - pd.Timedelta(days=cutoff_days)
+            cutoff_date_str = cutoff_dt.strftime("%Y-%m-%d")
+        except Exception:
+            cutoff_date_str = f"{cutoff_days}d ago"
+    st.caption(f"Using runs since **{cutoff_date_str}**, weighted by recency (half-life: **{half_life_days}d**).")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Summary Metrics Block
+    # ─────────────────────────────────────────────────────────────────────────
+    st.subheader("📋 Window Summary")
+    runs_count = len(runs_used)
+    raw_jobs = int(meta.get("raw_jobs", 0) or 0)
+    effective_jobs = float(meta.get("effective_jobs", 0) or 0)
+    min_ts = meta.get("min_ts", "")
+    max_ts_display = meta.get("max_ts", "")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Runs", runs_count)
+    m2.metric("Raw jobs", f"{raw_jobs:,}")
+    m3.metric("Effective jobs", f"{effective_jobs:,.0f}")
+    if min_ts and max_ts_display:
+        span = f"{min_ts[:10]} → {max_ts_display[:10]}"
+    else:
+        span = "—"
+    m4.metric("Span", span)
+
+    st.caption(f"Cutoff: {cutoff_days}d | Half-life: {half_life_days}d | Top N: {top_n}")
+    gen_at = cached.get("generated_at")
+    if gen_at:
+        st.caption(f"Generated: {gen_at}")
+
+    st.markdown("---")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Market Context (support levels + work arrangements)
+    # ─────────────────────────────────────────────────────────────────────────
+    _render_market_context_bars(weighted_summary, effective_jobs)
+
+    st.markdown("---")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Category Snapshots (tables default, with view toggle)
+    # ─────────────────────────────────────────────────────────────────────────
+    st.subheader("📁 Category Snapshots")
+
+    # Exclude market context categories (already shown above)
+    skip_cats = {"support_levels", "work_arrangements"}
+    for cat_key, cat_label in CATEGORY_LABELS.items():
+        if cat_key in skip_cats:
+            continue
+        cat_terms = top_terms.get(cat_key) or []
+        if not cat_terms:
+            continue
+        _render_category_snapshot(cat_key, cat_label, weighted_summary, cat_terms, series)
+
+    st.markdown("---")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AI Summary (collapsed)
+    # ─────────────────────────────────────────────────────────────────────────
+    with st.expander("🤖 AI Summary (Interpretation)", expanded=False):
+        # Build AI input from weighted summary
+        # Convert weighted_summary to simple counts for AI input
+        simple_summary = {}
+        for cat_key, terms_map in weighted_summary.items():
+            simple_summary[cat_key] = {term: int(data.get("weighted_count", 0)) for term, data in terms_map.items()}
+
+        ai_input = _build_ai_summary_input(
+            total_jobs=int(effective_jobs),
+            summary=simple_summary,
+            search_context={
+                "window": f"Last {cutoff_days} days (half-life {half_life_days}d)",
+                "runs": [r.get("name") for r in runs_used],
+            },
+            scope_label=f"overview_{cutoff_days}d_hl{half_life_days}d",
+            top_n_per_category=int(top_n),
+        )
+        ai_cache = OVERVIEW_DIR / f"ai_{_hash_payload(params)[:16]}.json"
+        _render_ai_summary_block(cache_path=ai_cache, ai_input=ai_input, auto_generate=False)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Explore Changes (Advanced) - collapsed
+    # ─────────────────────────────────────────────────────────────────────────
+    with st.expander("🔍 Explore Changes (Advanced)", expanded=False):
+        st.markdown("**Per-run trend lines** for detailed analysis of term frequency over time.")
+        if not series:
+            st.info("No series data available.")
+        else:
+            df = pd.DataFrame(series)
+            has_ts = "timestamp" in df.columns and df["timestamp"].notna().any()
+            x_col = "timestamp" if has_ts else "run_order"
+
+            for cat_key, cat_label in CATEGORY_LABELS.items():
+                terms = top_terms.get(cat_key) or []
+                if not terms:
+                    continue
+                subset = df[(df["category"] == cat_key) & (df["term"].isin(terms))].copy()
+                if subset.empty:
+                    continue
+
+                st.markdown(f"**{cat_label}**")
+                try:
+                    subset = subset.sort_values(by=[x_col, "term"], ascending=True)
+                except Exception:
+                    pass
+
+                fig = px.line(
+                    subset,
+                    x=x_col,
+                    y="pct",
+                    color="term",
+                    markers=True,
+                    labels={"pct": "% of jobs"},
+                )
+                fig.update_layout(
+                    legend_title_text="Term",
+                    margin=dict(l=10, r=10, t=20, b=10),
+                    height=300,
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
 
 def render_report_list():
@@ -1032,6 +1942,20 @@ def render_report_list():
             type="primary",
             disabled=compile_disabled,
         ):
+            # Detect whether a matching compiled report already exists for this exact selection.
+            # This avoids unnecessary compilation work and lets the compiled page show a clear notice.
+            try:
+                run_paths = [Path(p) for p in selected_paths]
+                run_names = [p.name for p in run_paths]
+                fingerprint = build_runs_fingerprint(run_paths)
+                report_path = compiled_report_path(STATE_DIR, run_names=run_names)
+                cached_report = load_compiled_report(report_path)
+                st.session_state.compiled_preexisting = bool(
+                    cached_report
+                    and is_matching_compiled_report(cached_report, run_names=run_names, fingerprint=fingerprint)
+                )
+            except Exception:
+                st.session_state.compiled_preexisting = False
             navigate_to(
                 "reports",
                 selected_run=None,
@@ -1056,87 +1980,131 @@ def render_report_list():
 
     # Confirmation dialog for deleting selected reports
     if st.session_state.delete_modal_open:
-        st.markdown("---")
-        st.warning("⚠️ **Confirm Deletion**")
-        st.write("This will permanently delete the selected report folders:")
-        for run_path in st.session_state.delete_candidates:
-            st.write(f"• {Path(run_path).name}")
-        col_confirm, col_cancel, _ = st.columns([1, 1, 2])
-        with col_confirm:
-            if st.button("✓ Confirm Delete", type="primary", use_container_width=True):
-                deleted = []
-                for run_path in st.session_state.delete_candidates:
-                    path_obj = Path(run_path)
-                    try:
-                        if path_obj.exists() and path_obj.is_dir():
-                            shutil.rmtree(path_obj)
-                            deleted.append(str(path_obj))
-                    except Exception:
-                        pass
-                st.session_state.selected_reports = [p for p in st.session_state.selected_reports if p not in deleted]
-                st.session_state.compiled_runs = [p for p in st.session_state.compiled_runs if p not in deleted]
-                if st.session_state.selected_run in deleted:
-                    navigate_to(
-                        "reports",
-                        selected_run=None,
-                        view_mode="overview",
-                        viewing_job_id=None,
-                        selected_filters={},
-                        filter_mode="any",
-                        search_text="",
-                    )
-                st.session_state.delete_candidates = []
-                st.session_state.delete_modal_open = False
-                st.rerun()
-        with col_cancel:
-            if st.button("✗ Cancel", use_container_width=True):
-                st.session_state.delete_modal_open = False
-                st.session_state.delete_candidates = []
-                st.rerun()
-
-
-def _merge_analyses(analyses: list[dict]) -> dict:
-    """Merge multiple requirements_analysis.json payloads into a combined summary."""
-    merged_summary: dict[str, dict[str, int]] = {k: {} for k in CATEGORY_LABELS.keys()}
-    total_jobs = 0
-    combined_job_details = []
-
-    for analysis in analyses:
-        if not analysis:
-            continue
-        total_jobs += int(analysis.get("total_jobs", 0) or 0)
-
-        summary = analysis.get("summary", {}) or {}
-        for cat in CATEGORY_LABELS.keys():
-            items = summary.get(cat, {}) or {}
-            bucket = merged_summary.setdefault(cat, {})
-            for term, count in items.items():
+        def _perform_delete() -> list[str]:
+            deleted: list[str] = []
+            for run_path in st.session_state.delete_candidates:
+                path_obj = Path(run_path)
                 try:
-                    bucket[term] = int(bucket.get(term, 0)) + int(count)
+                    if path_obj.exists() and path_obj.is_dir():
+                        shutil.rmtree(path_obj)
+                        deleted.append(str(path_obj))
                 except Exception:
                     pass
 
-        # Keep job_details only for aggregate company stats (not used for job linking)
-        combined_job_details.extend(analysis.get("job_details", []) or [])
+            st.session_state.selected_reports = [p for p in st.session_state.selected_reports if p not in deleted]
+            st.session_state.compiled_runs = [p for p in st.session_state.compiled_runs if p not in deleted]
+            return deleted
 
-    return {
-        "summary": merged_summary,
-        "total_jobs": total_jobs,
-        "job_details": combined_job_details,
-    }
+        if hasattr(st, "dialog"):
+            @st.dialog("Confirm deletion")
+            def _delete_dialog():
+                st.warning("⚠️ **Confirm Deletion**")
+                st.write("This will permanently delete the selected report folders:")
+                for run_path in st.session_state.delete_candidates:
+                    st.write(f"• {Path(run_path).name}")
+
+                col_confirm, col_cancel = st.columns(2)
+                with col_confirm:
+                    if st.button("✓ Confirm Delete", type="primary", use_container_width=True, key="dlg_confirm_delete"):
+                        deleted = _perform_delete()
+                        if st.session_state.selected_run in deleted:
+                            navigate_to(
+                                "reports",
+                                selected_run=None,
+                                view_mode="overview",
+                                viewing_job_id=None,
+                                selected_filters={},
+                                filter_mode="any",
+                                search_text="",
+                            )
+                        st.session_state.delete_candidates = []
+                        st.session_state.delete_modal_open = False
+                        st.rerun()
+                with col_cancel:
+                    if st.button("✗ Cancel", use_container_width=True, key="dlg_cancel_delete"):
+                        st.session_state.delete_modal_open = False
+                        st.session_state.delete_candidates = []
+                        st.rerun()
+
+            _delete_dialog()
+        else:
+            st.markdown("---")
+            st.warning("⚠️ **Confirm Deletion**")
+            st.write("This will permanently delete the selected report folders:")
+            for run_path in st.session_state.delete_candidates:
+                st.write(f"• {Path(run_path).name}")
+            col_confirm, col_cancel, _ = st.columns([1, 1, 2])
+            with col_confirm:
+                if st.button("✓ Confirm Delete", type="primary", use_container_width=True):
+                    deleted = _perform_delete()
+                    if st.session_state.selected_run in deleted:
+                        navigate_to(
+                            "reports",
+                            selected_run=None,
+                            view_mode="overview",
+                            viewing_job_id=None,
+                            selected_filters={},
+                            filter_mode="any",
+                            search_text="",
+                        )
+                    st.session_state.delete_candidates = []
+                    st.session_state.delete_modal_open = False
+                    st.rerun()
+            with col_cancel:
+                if st.button("✗ Cancel", use_container_width=True):
+                    st.session_state.delete_modal_open = False
+                    st.session_state.delete_candidates = []
+                    st.rerun()
+
+
+def _merge_analyses(analyses: list[dict]) -> dict:
+    # Wrapper kept for backwards compatibility (tests import this symbol).
+    return _ui_merge_analyses(analyses, category_keys=CATEGORY_LABELS.keys())
 
 
 def render_compiled_overview():
     """Render an aggregated overview across multiple selected runs."""
     st.header("🧩 Compiled Review")
 
+    # One-time notice set by the Reports page Compile(x) button.
+    if st.session_state.get("compiled_preexisting"):
+        st.info("Matching saved compiled report found; opening cached results.")
+        st.session_state.compiled_preexisting = False
+
     run_paths = list(dict.fromkeys(Path(p) for p in (st.session_state.compiled_runs or [])))
     if not run_paths:
         st.info("No reports selected for compilation.")
         return
 
+    run_names = [p.name for p in run_paths]
+    fingerprint = build_runs_fingerprint(run_paths)
+    report_path = compiled_report_path(STATE_DIR, run_names=run_names)
+
+    cached_report = load_compiled_report(report_path)
+    merged = None
+    used_saved_compiled = False
+    if cached_report and is_matching_compiled_report(cached_report, run_names=run_names, fingerprint=fingerprint):
+        maybe_merged = cached_report.get("merged_analysis")
+        if isinstance(maybe_merged, dict):
+            merged = maybe_merged
+            used_saved_compiled = True
+
     analyses: list[tuple[Path, dict | None]] = [(p, load_analysis(p)) for p in run_paths]
-    merged = _merge_analyses([a for _, a in analyses if a])
+    if merged is None:
+        merged = _merge_analyses([a for _, a in analyses if a])
+        try:
+            # Persist merged result so repeated compiled views are fast.
+            payload = build_compiled_report_payload(
+                run_names=run_names,
+                fingerprint=fingerprint,
+                merged_analysis=merged,
+                name=(cached_report or {}).get("name") if isinstance(cached_report, dict) else None,
+                created_at=(cached_report or {}).get("created_at") if isinstance(cached_report, dict) else None,
+            )
+            save_compiled_report_atomic(report_path, payload)
+        except Exception:
+            # Non-critical; compiled view should still work.
+            pass
 
     total_jobs = merged.get("total_jobs", 0)
     summary = merged.get("summary", {})
@@ -1155,6 +2123,8 @@ def render_compiled_overview():
                     pass
 
     st.caption(f"Includes {len(run_paths)} report(s)")
+    if used_saved_compiled:
+        st.caption("Using saved compiled report (no re-merge needed).")
     for p in run_paths:
         st.caption(f"- {p.name}")
 
@@ -1795,6 +2765,35 @@ def render_job_explorer():
     # Sort groups by size descending
     sorted_groups = sorted(groups.items(), key=lambda x: len(x[1]), reverse=True)
     
+    # Display active filters summary
+    active_filters = []
+    for cat, terms in st.session_state.selected_filters.items():
+        for term in terms:
+            active_filters.append((cat, term))
+    if active_filters or search_text:
+        col1, col2 = st.columns([3,1])
+        with col1:
+            filter_text = []
+            if search_text:
+                filter_text.append(f"🔎 {search_text}")
+            for cat, term in active_filters:
+                cat_label = CATEGORY_LABELS.get(cat, cat)
+                filter_text.append(f"{cat_label}: {term}")
+            if filter_text:
+                st.caption("Active filters: " + " | ".join(filter_text))
+        with col2:
+            if st.button("Clear All", key="clear_filters_main"):
+                navigate_to(
+                    "reports",
+                    selected_run=st.session_state.selected_run,
+                    view_mode="explorer",
+                    viewing_job_id=None,
+                    selected_filters={},
+                    filter_mode="any",
+                    search_text="",
+                )
+                st.rerun()
+    
     # Display results
     st.subheader(f"Results: {len(job_matches)} jobs")
     
@@ -2125,10 +3124,25 @@ def render_run_progress():
             except Exception:
                 started_at = None
 
-    def _read_log_tail(path: Path, max_lines: int = 400) -> str:
+    def _read_log_tail(path: Path, max_lines: int = 400, max_bytes: int = 120_000) -> str:
+        """Read the last N lines efficiently without loading the whole file."""
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+            if not path.exists():
+                return ""
+
+            with open(path, "rb") as f:
+                try:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    start = max(0, size - max_bytes)
+                    f.seek(start, os.SEEK_SET)
+                except Exception:
+                    # If seek fails, fall back to reading whole file.
+                    f.seek(0)
+
+                chunk = f.read()
+            text = chunk.decode("utf-8", errors="replace")
+            lines = text.splitlines(True)  # keepends
             if len(lines) <= max_lines:
                 return "".join(lines)
             return "".join(lines[-max_lines:])
@@ -2153,7 +3167,8 @@ def render_run_progress():
             if log_file and Path(log_file).exists():
                 log_content = _read_log_tail(Path(log_file), max_lines=400)
                 if log_content.strip():
-                    st.code(log_content, language="text")
+                    with st.container(height=400):
+                        st.code(log_content, language="text")
                 else:
                     st.caption("Waiting for output...")
             else:
@@ -2408,12 +3423,15 @@ def main():
     current_url_state = str(_get_query_params())
     if st.session_state.last_url_state is None or st.session_state.last_url_state != current_url_state:
         _apply_state_from_url()
+        _normalize_navigation_state()
         st.session_state.last_url_state = current_url_state
 
     render_sidebar()
     
     # Route to the appropriate page
-    if st.session_state.page == "reports":
+    if st.session_state.page == "overview":
+        render_overview_page()
+    elif st.session_state.page == "reports":
         render_reports_page()
     elif st.session_state.page == "new_run":
         render_new_run_page()

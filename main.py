@@ -256,6 +256,7 @@ Examples:
     python main.py --output results.csv      # Save to file
     python main.py --http                    # Use HTTP mode instead
     python main.py --source seek --format json
+    python main.py --keywords-list '["IT Support", "Help Desk"]' --location "Sydney"
         """
     )
 
@@ -264,6 +265,20 @@ Examples:
         type=str,
         default=None,
         help="Search keywords/job title (non-interactive). If omitted, prompts interactively."
+    )
+
+    parser.add_argument(
+        "--keywords-list",
+        type=str,
+        default=None,
+        help="JSON array of keyword phrases for bundle mode (e.g., '[\"IT Support\", \"Help Desk\"]'). Mutually exclusive with --keywords."
+    )
+
+    parser.add_argument(
+        "--bundle-ids",
+        type=str,
+        default=None,
+        help="Comma-separated bundle identifiers for metadata (used with --keywords-list)."
     )
 
     parser.add_argument(
@@ -342,7 +357,7 @@ Examples:
         "--max-details",
         type=int,
         default=None,
-        help="Maximum number of job details to fetch (default: all jobs)"
+        help="Maximum number of job details to fetch. Use 0 to skip detail fetching entirely. (default: all jobs)"
     )
     
     parser.add_argument(
@@ -357,6 +372,18 @@ Examples:
         action="store_true",
         help="Fetch job details sequentially instead of in parallel (slower but uses less resources)"
     )
+
+    parser.add_argument(
+        "--dedupe-before-details",
+        action="store_true",
+        help="Deduplicate jobs before fetching details (prevents redundant browser requests)."
+    )
+
+    parser.add_argument(
+        "--enable-scoring",
+        action="store_true",
+        help="Add deterministic APPLY/STRETCH/IGNORE scoring to jobs based on title/description signals."
+    )
     
     args = parser.parse_args()
 
@@ -369,6 +396,26 @@ Examples:
     else:
         forced_fuzzy = None
 
+    # Parse keywords-list (bundle mode) if provided
+    keywords_list: list[str] | None = None
+    bundle_ids: list[str] | None = None
+    if args.keywords_list:
+        import json as _json
+        try:
+            keywords_list = _json.loads(args.keywords_list)
+            if not isinstance(keywords_list, list) or not all(isinstance(k, str) for k in keywords_list):
+                raise ValueError("--keywords-list must be a JSON array of strings")
+        except Exception as e:
+            print(f"Error parsing --keywords-list: {e}")
+            return
+        if args.bundle_ids:
+            bundle_ids = [b.strip() for b in args.bundle_ids.split(",") if b.strip()]
+
+    # Validate mutually exclusive keywords options
+    if args.keywords and keywords_list:
+        print("Error: --keywords and --keywords-list are mutually exclusive.")
+        return
+
     # If any scrape-specific flags are provided, skip menu and go straight to scrape
     has_non_default_scrape_flags = any([
         args.http,
@@ -378,7 +425,10 @@ Examples:
         args.format != "csv",
         args.keywords is not None,
         args.location is not None,
+        keywords_list is not None,
         forced_fuzzy is not None,
+        args.enable_scoring,
+        args.dedupe_before_details,
     ])
 
     if not has_non_default_scrape_flags:
@@ -394,37 +444,90 @@ Examples:
     seen_urls = load_seen_urls()
 
     # Get search parameters (non-interactive when provided)
-    if args.keywords is not None or args.location is not None or forced_fuzzy is not None:
-        keywords = (args.keywords or "").strip() or DEFAULT_KEYWORDS
-        location = (args.location or "").strip() or DEFAULT_LOCATION
-        pages = int(args.pages)
-        use_fuzzy = bool(forced_fuzzy) if forced_fuzzy is not None else False
+    if args.keywords is not None or args.location is not None or keywords_list is not None or forced_fuzzy is not None:
+        # Bundle mode: use keywords_list directly
+        if keywords_list:
+            keywords = ", ".join(keywords_list[:3]) + ("..." if len(keywords_list) > 3 else "")  # Display label
+            location = (args.location or "").strip() or DEFAULT_LOCATION
+            pages = int(args.pages)
+            use_fuzzy = False  # Fuzzy not used in bundle mode
+            search_terms = keywords_list  # Already expanded
+        else:
+            keywords = (args.keywords or "").strip() or DEFAULT_KEYWORDS
+            location = (args.location or "").strip() or DEFAULT_LOCATION
+            pages = int(args.pages)
+            use_fuzzy = bool(forced_fuzzy) if forced_fuzzy is not None else False
+            # Expand search terms if fuzzy search enabled
+            if use_fuzzy:
+                search_terms = expand_search_terms(keywords)
+            else:
+                search_terms = [keywords]
     else:
         keywords, location, pages, use_fuzzy = get_search_parameters()
-
-    # Expand search terms if fuzzy search enabled
-    if use_fuzzy:
-        search_terms = expand_search_terms(keywords)
-    else:
-        search_terms = [keywords]
+        # Expand search terms if fuzzy search enabled
+        if use_fuzzy:
+            search_terms = expand_search_terms(keywords)
+        else:
+            search_terms = [keywords]
 
     # Create job collection with search context
     collection = JobCollection()
-    collection.set_search_params(keywords, location)
+    # For bundle mode, use first keyword as primary (or join all for metadata)
+    primary_keywords = keywords_list[0] if keywords_list else keywords
+    collection.set_search_params(primary_keywords, location)
+    
+    # Store bundle metadata for compiled_jobs.md
+    bundle_metadata = None
+    if keywords_list:
+        bundle_metadata = {
+            "keywords_list": keywords_list,
+            "bundle_ids": bundle_ids,
+        }
     
     print(f"\n{'='*60}")
-    print(f"Job Scraper - Searching for '{keywords}' in '{location}'")
-    if use_fuzzy and len(search_terms) > 1:
-        print(f"Fuzzy search enabled: {len(search_terms)} search variants")
+    if keywords_list:
+        print(f"Job Scraper - Bundle Mode: {len(keywords_list)} keyword phrases in '{location}'")
+        for i, kw in enumerate(keywords_list, 1):
+            print(f"  [{i}] {kw}")
+    else:
+        print(f"Job Scraper - Searching for '{keywords}' in '{location}'")
+        if use_fuzzy and len(search_terms) > 1:
+            print(f"Fuzzy search enabled: {len(search_terms)} search variants")
     print(f"Max pages per search: {pages}")
     if args.http:
         print("Mode: HTTP requests")
     else:
         print("Mode: Browser-based (Selenium)")
+    if args.enable_scoring:
+        print("Scoring: Enabled (APPLY/STRETCH/IGNORE)")
     print(f"{'='*60}\n")
     
     # Use browser-based scraping by default, HTTP only when --http is specified
     scraper = None
+
+    def _dedupe_collection_by_url() -> int:
+        """Deduplicate collection.jobs by URL while preserving order.
+
+        Returns number of removed duplicates.
+        """
+        if len(collection) == 0:
+            return 0
+        seen_in_collection: set[str] = set()
+        unique_jobs = []
+        removed = 0
+        for job in collection.jobs:
+            url = getattr(job, "url", None)
+            if not url:
+                unique_jobs.append(job)
+                continue
+            if url in seen_in_collection:
+                removed += 1
+                continue
+            seen_in_collection.add(url)
+            unique_jobs.append(job)
+        collection.jobs = unique_jobs
+        return removed
+
     if not args.http:
         try:
             from browser_scraper import BrowserScraper
@@ -456,26 +559,21 @@ Examples:
                 skipped_count = original_count - len(collection)
                 if skipped_count > 0:
                     print(f"Skipping {skipped_count} jobs already seen in previous runs")
+
+            # Always deduplicate by URL (fuzzy variants, bundle overlap, and/or cross-source can repeat jobs)
+            duplicates_removed = _dedupe_collection_by_url()
+            if duplicates_removed > 0:
+                print(f"Removed {duplicates_removed} duplicate jobs (URL-based)")
             
-            # Deduplicate within collection (fuzzy search may return same jobs)
-            if len(search_terms) > 1 and len(collection) > 0:
-                seen_in_collection = set()
-                unique_jobs = []
-                for job in collection.jobs:
-                    if job.url and job.url not in seen_in_collection:
-                        seen_in_collection.add(job.url)
-                        unique_jobs.append(job)
-                duplicates_removed = len(collection) - len(unique_jobs)
-                if duplicates_removed > 0:
-                    print(f"Removed {duplicates_removed} duplicate jobs from fuzzy search")
-                collection.jobs = unique_jobs
-            
-            # Always fetch full job descriptions in browser mode
-            if len(collection) > 0:
+            # Fetch full job descriptions in browser mode (unless max_details == 0)
+            skip_details = args.max_details == 0
+            if len(collection) > 0 and not skip_details:
                 if args.sequential:
                     scraper.fetch_job_details_sequential(collection.jobs, max_jobs=args.max_details)
                 else:
                     scraper.fetch_job_details(collection.jobs, max_jobs=args.max_details, workers=args.workers)
+            elif skip_details:
+                print("Skipping job detail fetching (--max-details 0)")
             
             scraper.close()
             scraper = None
@@ -522,8 +620,29 @@ Examples:
         if skipped_count > 0:
             print(f"Skipping {skipped_count} jobs already seen in previous runs")
 
+    # Always deduplicate by URL in HTTP mode too (cross-page duplicates happen occasionally)
+    duplicates_removed = _dedupe_collection_by_url()
+    if duplicates_removed > 0:
+        print(f"Removed {duplicates_removed} duplicate jobs (URL-based)")
+
     # Export results
     if len(collection) > 0:
+        # Apply scoring if enabled (after details fetch, before export)
+        if args.enable_scoring:
+            print("\n" + "=" * 60)
+            print("Scoring jobs (APPLY/STRETCH/IGNORE)...")
+            print("=" * 60)
+            try:
+                from job_scorer import score_jobs
+                score_jobs(collection.jobs)
+                # Count classifications
+                apply_count = sum(1 for j in collection.jobs if getattr(j, "classification", None) == "APPLY")
+                stretch_count = sum(1 for j in collection.jobs if getattr(j, "classification", None) == "STRETCH")
+                ignore_count = sum(1 for j in collection.jobs if getattr(j, "classification", None) == "IGNORE")
+                print(f"  APPLY: {apply_count} | STRETCH: {stretch_count} | IGNORE: {ignore_count}")
+            except Exception as e:
+                print(f"Warning: Could not apply scoring: {e}")
+        
         # Persist URLs so future runs can skip already-seen jobs
         try:
             add_urls(job.url for job in collection.jobs if job.url)
@@ -542,8 +661,9 @@ Examples:
             collection.to_json()
         
         # Always create compiled text file for AI analysis
+        # Pass bundle metadata for enhanced header
         collection.to_compiled_text()
-        collection.to_markdown()
+        collection.to_markdown(bundle_metadata=bundle_metadata)
         
         print(f"\n📁 All data saved to: {run_folder}")
         print(f"   📄 compiled_jobs.txt - Plain text for AI analysis")

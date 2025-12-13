@@ -62,3 +62,9 @@ requirements_index.json
 # Local URL/cookie state (can contain sensitive or machine-specific data)
 seen_urls.json
 cookies*.json
+
+# Agent files
+.github/agents/
+
+# Overview document
+overview.md

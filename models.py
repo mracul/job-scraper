@@ -20,6 +20,11 @@ class Job:
     source: str  # 'seek' or 'jora'
     full_description: Optional[str] = None  # Full job description from detail page
     date_posted: Optional[str] = None  # Date the job was posted (e.g., "2d ago", "30d+ ago")
+    # Scoring fields (optional, populated when --enable-scoring is used)
+    score: Optional[int] = None
+    classification: Optional[str] = None  # APPLY, STRETCH, IGNORE
+    matched_signals: Optional[str] = None
+    exclude_reason: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert job to dictionary."""
@@ -201,8 +206,13 @@ class JobCollection:
         print(f"Compiled {len(self.jobs)} jobs to {filename}")
         return filename
 
-    def to_markdown(self, filename: str = None) -> str:
-        """Export all jobs to a Markdown file for easy reading and AI analysis."""
+    def to_markdown(self, filename: str = None, bundle_metadata: dict = None) -> str:
+        """Export all jobs to a Markdown file for easy reading and AI analysis.
+        
+        Args:
+            filename: Output filename (optional, defaults to run_folder/compiled_jobs.md)
+            bundle_metadata: Optional dict with 'keywords_list' and 'bundle_ids' for bundle mode
+        """
         if not self.jobs:
             print("No jobs to compile.")
             return ""
@@ -220,6 +230,20 @@ class JobCollection:
             f.write(f"**Search Keywords:** {self.search_keywords or 'Not specified'}  \n")
             f.write(f"**Search Location:** {self.search_location or 'Not specified'}  \n")
             f.write(f"**Total Jobs:** {len(self.jobs)}\n\n")
+            
+            # Bundle metadata (if provided)
+            if bundle_metadata:
+                keywords_list = bundle_metadata.get("keywords_list") or []
+                bundle_ids = bundle_metadata.get("bundle_ids") or []
+                if keywords_list:
+                    f.write(f"**Search Mode:** Bundle ({len(keywords_list)} phrases)  \n")
+                    f.write(f"**Keyword Phrases:**  \n")
+                    for kw in keywords_list:
+                        f.write(f"- {kw}  \n")
+                if bundle_ids:
+                    f.write(f"**Bundle IDs:** {', '.join(bundle_ids)}  \n")
+                f.write("\n")
+            
             f.write("---\n\n")
             
             # Table of contents
@@ -239,7 +263,15 @@ class JobCollection:
                 f.write(f"| **Location** | {job.location} |\n")
                 f.write(f"| **Salary** | {job.salary or 'Not specified'} |\n")
                 f.write(f"| **Source** | {job.source} |\n")
-                f.write(f"| **URL** | [{job.url[:50]}...]({job.url}) |\n\n")
+                f.write(f"| **URL** | [{job.url[:50]}...]({job.url}) |\n")
+                
+                # Include scoring if available
+                if hasattr(job, 'classification') and job.classification:
+                    f.write(f"| **Score** | {job.score} ({job.classification}) |\n")
+                    if job.matched_signals:
+                        f.write(f"| **Signals** | {job.matched_signals} |\n")
+                
+                f.write("\n")
                 
                 f.write("### Description\n\n")
                 description = job.full_description if job.full_description else job.description

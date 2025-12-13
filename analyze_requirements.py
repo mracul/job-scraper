@@ -491,11 +491,14 @@ def find_latest_run() -> str:
     scraped_data_dir = Path(__file__).parent / "scraped_data"
     if not scraped_data_dir.exists():
         return None
-    
-    run_folders = sorted(scraped_data_dir.glob("run_*"), reverse=True)
-    if run_folders:
-        return str(run_folders[0])
-    return None
+
+    # Support both legacy run_YYYYMMDD_* folders and newer keyword_location_timestamp folders.
+    candidates: list[Path] = [p for p in scraped_data_dir.iterdir() if p.is_dir()]
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(candidates[0])
 
 
 def main():
