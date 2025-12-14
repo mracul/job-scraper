@@ -74,14 +74,18 @@ class JobRequirementsAnalyzer:
             # Keep this, but remove AZ-/MS- matches from here so codes don't double-count.
             'Microsoft Certified (Generic/Legacy)': r'\b(Microsoft\s+Certified|MCP|MCSE|MCSA|MCSD)\b',
             
-            # CompTIA Certifications
-            'CompTIA A+': r'\bCompTIA\s*A\+|\bA\+\s*[Cc]ertif',
+            # CompTIA Certifications - match both "CompTIA X+" and standalone "X+" in cert contexts
+            'CompTIA A+': r'\bCompTIA\s*A\+|\bA\+(?=\s*[,.\)\]\s]|$)',
             'CompTIA Network+': r'\bCompTIA\s*Network\+|\bNetwork\+',
             'CompTIA Security+': r'\bCompTIA\s*Security\+|\bSecurity\+',
             'CompTIA Server+': r'\bCompTIA\s*Server\+|\bServer\+',
+            'CompTIA Cloud+': r'\bCompTIA\s*Cloud\+|\bCloud\+',
+            'CompTIA Linux+': r'\bCompTIA\s*Linux\+|\bLinux\+',
+            'CompTIA CySA+': r'\bCompTIA\s*CySA\+|\bCySA\+',
+            'CompTIA PenTest+': r'\bCompTIA\s*PenTest\+|\bPenTest\+',
             
-            # ITIL
-            'ITIL': r'\bITIL\b',
+            # ITIL - captures ITIL with optional version/foundation
+            'ITIL': r'\bITIL\s*(\d|Foundation|v\d|Practitioner|Expert)?\b',
             
             # Cisco
             'CCNA': r'\bCCNA\b',
@@ -99,6 +103,9 @@ class JobRequirementsAnalyzer:
             
             # Vendor Specific
             'VMware Certified': r'\b(VMware|VCP|VCAP)\s*(Certified|Professional)?\b',
+            
+            # Additional certifications
+            'Certified (Generic)': r'\b[Cc]ertified\s+(in|for|as)\b|\b[Cc]ertification\s+(in|for|required|preferred|desired)',
         }
 
         # Microsoft certification code to friendly name mapping
@@ -131,23 +138,27 @@ class JobRequirementsAnalyzer:
         # Technical skills patterns
         self.technical_skills = {
             # Operating Systems
-            'Windows 10/11': r'\bWindows\s*(10|11|10\/11|Desktop)\b',
+            'Windows': r'\bWindows\b',  # Generic Windows (catches all)
+            'Windows 10/11': r'\bWindows\s*(10|11|10\/11)\b',  # Specific desktop versions
             'Windows Server': r'\bWindows\s*Server\s*(\d{4})?\b',
-            'macOS': r'\b(macOS|Mac\s*OS|Apple\s*(Mac|Desktop))\b',
-            'Linux': r'\b(Linux|Ubuntu)\b',
+            'macOS': r'\b(macOS|Mac\s*OS|Apple\s*(Mac|Desktop)|Mac\s*(computer|laptop)?)\b',
+            'Linux': r'\b(Linux|Ubuntu|CentOS|RedHat|RHEL|Debian)\b',
             
             # Microsoft Stack
             'Microsoft 365': r'\b(Microsoft\s*365|M365|MS\s*365|Office\s*365|O365)\b',
-            'Active Directory': r'\bActive\s*Directory\b',
-            'Azure AD/Entra': r'\b(Azure\s*AD|Entra\s*ID|Azure\s*Active\s*Directory|EntraID)\b',
+            'Microsoft Office': r'\b(Microsoft\s*Office|MS\s*Office|Office\s*(Suite|applications?)?)\b',  # Non-365 Office
+            'Active Directory': r'\b(Active\s*Directory|\bAD\b(?=\s*(admin|user|account|group|domain|forest|object|management|experience|knowledge)))\b',  # AD with context
+            'Azure AD/Entra': r'\b(Azure\s*AD|Entra\s*ID|Azure\s*Active\s*Directory|EntraID|AAD)\b',
             'Exchange': r'\bExchange\s*(Online|Server)?\b',
             'SharePoint': r'\bSharePoint\b',
             'Teams': r'\b(Microsoft\s+)?Teams\b',
             'Intune': r'\b(Microsoft\s*)?Intune\b',
-            'SCCM/Endpoint Manager': r'\b(SCCM|System\s*Center|Endpoint\s*Manager|ConfigMgr)\b',
+            'SCCM/Endpoint Manager': r'\b(SCCM|System\s*Center|Endpoint\s*Manager|ConfigMgr|MEM)\b',
             'PowerShell': r'\bPowerShell\b',
             'Group Policy': r'\b(Group\s*Policy|GPO)\b',
             'Azure': r'\bAzure\b(?!\s*(AD|Active\s*Directory))',
+            'OneDrive': r'\bOneDrive\b',
+            'Outlook': r'\bOutlook\b',
             
             # Networking
             'TCP/IP': r'\bTCP\/IP\b',
@@ -156,18 +167,20 @@ class JobRequirementsAnalyzer:
             'VPN': r'\bVPN\b',
             'Firewall': r'\b[Ff]irewall\b',
             'LAN/WAN': r'\b(LAN|WAN|LAN\/WAN)\b',
-            'Networking': r'\b[Nn]etwork(ing)?\s*(fundamentals|knowledge|experience)?\b',
-            'VoIP/IP Telephony': r'\b(IP\s*[Tt]elephon|VOIP|VoIP|IP\s*[Pp]hone)\b',
+            'Networking': r'\b[Nn]etwork(ing|s)?\b',  # Simplified - catches more
+            'VoIP/IP Telephony': r'\b(IP\s*[Tt]elephon|VOIP|VoIP|IP\s*[Pp]hone|telephony)\b',
+            'Wi-Fi': r'\b(Wi-?Fi|WiFi|[Ww]ireless)\b',
             
             # Virtualization & Cloud
             'VMware': r'\bVMware\b',
             'Hyper-V': r'\bHyper-?V\b',
             'Citrix': r'\bCitrix\b',
-            'Cloud Services': r'\b[Cc]loud[\s-]*(based|services?|computing)?\b',
+            'Cloud Services': r'\b[Cc]loud\b',  # Simplified - catches cloud anything
+            'AWS': r'\bAWS\b',
             
             # Remote & AV Support
-            'Remote Support Tools': r'\b(TeamViewer|RDP|Remote\s*Desktop|AnyDesk)\b',
-            'Video Conferencing': r'\b(Video\s*[Cc]onferenc|Zoom|WebEx|Polycom|Surface\s*Hub)\b',
+            'Remote Support Tools': r'\b(TeamViewer|RDP|Remote\s*Desktop|AnyDesk|LogMeIn|ConnectWise)\b',
+            'Video Conferencing': r'\b(Video\s*[Cc]onferenc|Zoom|WebEx|Polycom|Surface\s*Hub|Google\s*Meet)\b',
             'AV Support': r'\b(AV\s*support|[Aa]udio[\s-]*[Vv]isual)\b',
             
             # Ticketing/ITSM
@@ -176,34 +189,41 @@ class JobRequirementsAnalyzer:
             'Freshdesk': r'\bFresh[Dd]esk\b',
             'JIRA': r'\bJIRA\b',
             'Ticketing System': r'\b[Tt]icketing\s*[Ss]ystem\b',
-            'ITSM Tools': r'\b(ITSM|ManageEngine|FreshService)\b',
+            'ITSM Tools': r'\b(ITSM|ManageEngine|FreshService|Autotask|ConnectWise\s*Manage|Halo\s*PSA)\b',
             
             # Mobile Device Management
             'MDM': r'\bMDM\b|Mobile\s*Device\s*Management',
             'JAMF': r'\bJAMF\b',
+            'Mobile Devices': r'\b(mobile\s*device|iOS|Android|iPhone|iPad|smartphone|tablet)\b',
             
             # Hardware & Deployment
-            'Hardware Troubleshooting': r'\b[Hh]ardware\s*(troubleshoot|support|repair)',
-            'Printers': r'\b[Pp]rinter\s*(support|troubleshoot|management)?',
+            'Hardware': r'\b[Hh]ardware\b',  # Generic hardware
+            'Printers': r'\b[Pp]rinter\b',  # Simplified
             'System Imaging': r'\b[Ii]maging\b',
             'Software Deployment': r'\b(software\s*)?[Dd]eployment\b',
             'Patching': r'\b[Pp]atch(ing|es)?\b',
+            'Laptop/Desktop': r'\b(laptop|desktop|PC|workstation)\b',
             
             # Database & Scripting
             'SQL/Database': r'\b(SQL|MSSQL|[Dd]atabase)\b',
             'Scripting': r'\b[Ss]cripting\b',
-            'Programming': r'\b(Python|PowerShell|Go|React|JavaScript|programming)\b',
+            'Programming': r'\b(Python|PowerShell|Go|React|JavaScript|TypeScript|C#|\.NET|programming|coding)\b',
             
             # Security
             'Security': r'\b[Ss]ecurity\b',
             'Mimecast': r'\bMimecast\b',
             'Backup': r'\b[Bb]ackup\b',
+            'Antivirus/EDR': r'\b(antivirus|anti-virus|EDR|endpoint\s*detection|CrowdStrike|Defender|Sophos|Sentinel\s*One)\b',
+            'MFA/2FA': r'\b(MFA|2FA|multi[\s-]*factor|two[\s-]*factor)\b',
             
             # Vendor Specific
             'Cisco': r'\bCisco\b',
             'Fortinet': r'\bFortinet\b',
             'Meraki': r'\bMeraki\b',
             'UniFi': r'\bUniFi\b',
+            'HP/HPE': r'\b(HP|HPE|Hewlett[\s-]*Packard)\b',
+            'Dell': r'\bDell\b',
+            'Lenovo': r'\bLenovo\b',
         }
         
         # Soft skills patterns
@@ -380,15 +400,17 @@ class JobRequirementsAnalyzer:
             if term_lower == 'tafe' and 'tafe' in window and not any(edu_word in window for edu_word in ['education', 'qualification', 'study', 'degree']):
                 return False
         
-        # Technical skills gating
+        # Technical skills gating - more permissive now
         elif category == 'technical_skills':
-            # Skip generic terms that aren't actually requirements
-            if term_lower in ['networking', 'security', 'backup'] and not any(req_word in window for req_word in ['required', 'experience', 'knowledge', 'familiar', 'understanding']):
-                return False
-            
-            # Skip if it's just mentioning a product/company without requiring knowledge
-            if term_lower in ['cisco', 'fortinet', 'meraki', 'unifi', 'vmware', 'citrix'] and not any(req_word in window for req_word in ['experience', 'knowledge', 'certified', 'familiar']):
-                return False
+            # For vendor names, only gate if clearly company boilerplate (not requirements)
+            if term_lower in ['cisco', 'fortinet', 'meraki', 'unifi', 'vmware', 'citrix', 'hp/hpe', 'dell', 'lenovo']:
+                # Skip only if explicitly in "about us" / company description context
+                company_context_phrases = ['we are', 'our company', 'about us', 'we use', 'our partner', 'partner with']
+                if any(phrase in window for phrase in company_context_phrases):
+                    # But still count if there's also a requirement signal
+                    req_signals = ['experience', 'knowledge', 'skills', 'required', 'preferred', 'familiar', 'understanding', 'proficien']
+                    if not any(sig in window for sig in req_signals):
+                        return False
         
         # Experience gating
         elif category == 'experience':
@@ -625,7 +647,7 @@ class JobRequirementsAnalyzer:
                     # Get context and weight
                     label, weight = self._context_label_and_weight(match.start(), match.end(), job_text)
                     
-                    # For certifications, track both family bucket and specific code
+                    # For certifications, track family bucket and optionally specific Microsoft codes
                     if category_name == 'certifications':
                         # Add family bucket always
                         family = name
@@ -638,23 +660,24 @@ class JobRequirementsAnalyzer:
                             'score': 1.0 * weight,
                         })
 
-                        # Then add the specific code term if it maps
-                        matched_text = match.group(0).upper()
-                        specific = None
-                        friendly = self.microsoft_cert_code_map.get(matched_text)
-                        if friendly:
-                            specific = f"{matched_text} ({friendly})"
-                        else:
-                            specific = matched_text  # keep raw codes too
+                        # For Microsoft cert codes only, add specific code with friendly name
+                        matched_text = match.group(0).upper().strip()
+                        # Check if this is a Microsoft cert code (AZ-xxx, MS-xxx, etc.)
+                        if re.match(r'^(AZ|MS|MD|SC|PL|DP|MB|AI|AD|WS)-\d{3}$', matched_text):
+                            friendly = self.microsoft_cert_code_map.get(matched_text)
+                            if friendly:
+                                specific = f"{matched_text} ({friendly})"
+                            else:
+                                specific = matched_text
 
-                        if specific and specific not in results['presence'][category_name]:
-                            results['presence'][category_name].append(specific)
-                        results['weighted'][category_name].append({
-                            'term': specific,
-                            'weight': weight,
-                            'label': label,
-                            'score': 1.0 * weight,
-                        })
+                            if specific and specific not in results['presence'][category_name]:
+                                results['presence'][category_name].append(specific)
+                            results['weighted'][category_name].append({
+                                'term': specific,
+                                'weight': weight,
+                                'label': label,
+                                'score': 1.0 * weight,
+                            })
                         continue
                     
                     # For non-certifications, use the pattern name as display name
@@ -980,11 +1003,19 @@ def find_latest_run() -> str:
 def main():
     """Main entry point."""
     import argparse
+    import sys
     
     parser = argparse.ArgumentParser(description="Analyze job requirements from compiled listings")
     parser.add_argument('--input', '-i', help="Path to compiled_jobs.md or jobs.jsonl")
     parser.add_argument('--output', '-o', help="Output directory for reports")
     args = parser.parse_args()
+
+    # Best-effort: avoid UnicodeEncodeError on Windows consoles (cp1252, etc.)
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     
     # Find input file
     if args.input:
@@ -1029,7 +1060,12 @@ def main():
     
     report = analyzer.generate_report(analysis, output_dir, search_metadata=search_metadata)
     
-    print(report)
+    try:
+        print(report)
+    except UnicodeEncodeError:
+        # If the console can't render some characters, print a safe version
+        safe = str(report).encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        print(safe)
 
 
 if __name__ == "__main__":
