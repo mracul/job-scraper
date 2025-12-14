@@ -33,16 +33,30 @@ A comprehensive Python web scraper that collects, analyzes, and reports on job l
 
 ## Usage
 
-### Basic Usage
-Run the scraper with interactive prompts:
+### Recommended: Streamlit Interface (Easiest)
+
+For the best experience, use the visual Streamlit dashboard:
+
+```bash
+run_streamlit.bat
+```
+
+The dashboard provides:
+- **Visual parameter selection** - No need to remember command line options
+- **Interactive scraping** - Start and monitor scrapes with progress indicators
+- **Report browsing** - Drill down into requirements analysis with filters and charts
+- **AI summary generation** - Create and view AI-powered insights
+- **Settings management** - Adjust analysis parameters and view system status
+
+### Command Line Usage (Advanced)
+
+For automated scripts or headless environments, use the command line interface:
 
 ```bash
 python main.py
 ```
 
-You'll be prompted for:
-- Job title/keywords (default: "help desk it")
-- Location (default: "Auburn NSW")
+You'll be prompted for job title/keywords and location, or use command line options for automation.
 
 ### Advanced Command Line Examples
 
@@ -154,6 +168,8 @@ CERTIFICATIONS
 ```
 
 ## Streamlit Dashboard
+
+<img src="ui.png" width="600" alt="Job Scraper Streamlit Interface Screenshot">
 
 Visual interface for the complete workflow:
 
