@@ -14,6 +14,7 @@ from threading import Lock
 from urllib.parse import urlencode, urljoin, urlparse, parse_qs, urlunparse
 import time
 import random
+import markdownify
 from models import Job
 
 
@@ -226,7 +227,12 @@ class BrowserScraper:
                     ]:
                         try:
                             desc_elem = driver.find_element(By.CSS_SELECTOR, selector)
-                            full_desc = desc_elem.text.strip()
+                            html = desc_elem.get_attribute("innerHTML")
+                            if html:
+                                full_desc = markdownify.markdownify(html, heading_style="ATX").strip()
+                            else:
+                                full_desc = desc_elem.text.strip()
+                            
                             if full_desc and len(full_desc) > 50:
                                 break
                         except NoSuchElementException:
@@ -234,6 +240,7 @@ class BrowserScraper:
 
                 elif job.source == "jora":
                     for selector in [
+                        "#job-description-container",
                         ".job-description",
                         ".description",
                         "[class*='description']",
@@ -242,7 +249,12 @@ class BrowserScraper:
                     ]:
                         try:
                             desc_elem = driver.find_element(By.CSS_SELECTOR, selector)
-                            full_desc = desc_elem.text.strip()
+                            html = desc_elem.get_attribute("innerHTML")
+                            if html:
+                                full_desc = markdownify.markdownify(html, heading_style="ATX").strip()
+                            else:
+                                full_desc = desc_elem.text.strip()
+
                             if full_desc and len(full_desc) > 50:
                                 break
                         except NoSuchElementException:
@@ -335,18 +347,14 @@ class BrowserScraper:
                 # Try to find job description based on source
                 full_desc = None
                 
-                if job.source == "seek":
-                    # Seek job description selectors
-                    for selector in [
-                        "[data-automation='jobAdDetails']",
-                        "[data-automation='jobDescription']", 
-                        ".job-description",
-                        "[class*='jobDescription']",
-                        "div[data-automation='jobAdDetails'] div"
-                    ]:
                         try:
                             desc_elem = self.driver.find_element(By.CSS_SELECTOR, selector)
-                            full_desc = desc_elem.text.strip()
+                            html = desc_elem.get_attribute("innerHTML")
+                            if html:
+                                full_desc = markdownify.markdownify(html, heading_style="ATX").strip()
+                            else:
+                                full_desc = desc_elem.text.strip()
+                            
                             if full_desc and len(full_desc) > 50:
                                 break
                         except NoSuchElementException:
@@ -355,6 +363,7 @@ class BrowserScraper:
                 elif job.source == "jora":
                     # Jora job description selectors
                     for selector in [
+                        "#job-description-container",
                         ".job-description",
                         ".description",
                         "[class*='description']",
@@ -363,7 +372,12 @@ class BrowserScraper:
                     ]:
                         try:
                             desc_elem = self.driver.find_element(By.CSS_SELECTOR, selector)
-                            full_desc = desc_elem.text.strip()
+                            html = desc_elem.get_attribute("innerHTML")
+                            if html:
+                                full_desc = markdownify.markdownify(html, heading_style="ATX").strip()
+                            else:
+                                full_desc = desc_elem.text.strip()
+
                             if full_desc and len(full_desc) > 50:
                                 break
                         except NoSuchElementException:
@@ -524,11 +538,15 @@ class BrowserScraper:
             date_posted = None
             for selector in ["[data-automation='jobListingDate']", "[data-testid='listing-date']", "span[data-automation='jobListingDate']", "time", ".listing-date"]:
                 try:
-                    date_elem = card.find_element(By.CSS_SELECTOR, selector)
-                    date_posted = date_elem.text.strip()
+                    date_elems = card.find_elements(By.CSS_SELECTOR, selector)
+                    for elem in date_elems:
+                        text = elem.text.strip()
+                        if text:
+                            date_posted = text
+                            break
                     if date_posted:
                         break
-                except NoSuchElementException:
+                except Exception:
                     continue
 
             if not title:
