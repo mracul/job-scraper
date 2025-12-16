@@ -121,7 +121,12 @@ FILTER_WIDGET_KEYS = [f"filter_{cat_key}" for cat_key in CATEGORY_LABELS]
 
 
 def _get_openai_api_key() -> str | None:
-    """Get OpenAI API key from Streamlit secrets or environment."""
+    """Get OpenAI API key from environment or Streamlit secrets."""
+    # Prioritize environment variable (useful for local dev/overrides)
+    env_value = os.getenv("OPENAI_API_KEY")
+    if env_value:
+        return env_value
+
     for key_name in ("OPENAI_API_KEY", "openai_api_key"):
         try:
             value = st.secrets.get(key_name)
@@ -129,8 +134,8 @@ def _get_openai_api_key() -> str | None:
             value = None
         if value:
             return str(value)
-    env_value = os.getenv("OPENAI_API_KEY")
-    return env_value or None
+    
+    return None
 
 
 def _stable_json_dumps(obj) -> str:
