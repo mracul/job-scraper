@@ -2002,6 +2002,9 @@ def render_report_list():
                 except Exception:
                     pass
 
+            # Clear cache so list updates immediately
+            list_runs.clear()
+
             st.session_state.selected_reports = [p for p in st.session_state.selected_reports if p not in deleted]
             st.session_state.compiled_runs = [p for p in st.session_state.compiled_runs if p not in deleted]
             return deleted
@@ -3431,7 +3434,7 @@ def render_settings_page():
     with st.form("settings_form"):
         st.subheader("AI Settings")
         
-        ai_model_options = ["gpt-5-mini", "gpt-5.1"]
+        ai_model_options = ["gpt-5-mini", "gpt-5.1", "gpt-5.2"]
         current_model = ai_settings.get("model", "gpt-5-mini")
         model_index = ai_model_options.index(current_model) if current_model in ai_model_options else 0
         

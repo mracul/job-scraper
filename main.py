@@ -1,4 +1,4 @@
-""" 
+"""
 Job Scraper - Scrape job listings from Seek and Jora (browser mode).
 
 Usage:
@@ -9,8 +9,11 @@ import argparse
 from datetime import datetime
 from seek_scraper import SeekScraper
 from models import JobCollection
+from job_storage import JobStorage
+from deduplication import Deduplicator
 from url_skip_store import load_seen_urls, add_urls
 from pathlib import Path
+import os
 
 # Default search values
 DEFAULT_KEYWORDS = "help desk it"
@@ -512,33 +515,10 @@ Examples:
         print("Mode: Browser-based (Selenium)")
     if args.enable_scoring:
         print("Scoring: Enabled (APPLY/STRETCH/IGNORE)")
-    print(f"{'='*60}\n")
+    print(f"{ '='*60}\n")
     
     # Use browser-based scraping by default, HTTP only when --http is specified
     scraper = None
-
-    def _dedupe_collection_by_url() -> int:
-        """Deduplicate collection.jobs by URL while preserving order.
-
-        Returns number of removed duplicates.
-        """
-        if len(collection) == 0:
-            return 0
-        seen_in_collection: set[str] = set()
-        unique_jobs = []
-        removed = 0
-        for job in collection.jobs:
-            url = getattr(job, "url", None)
-            if not url:
-                unique_jobs.append(job)
-                continue
-            if url in seen_in_collection:
-                removed += 1
-                continue
-            seen_in_collection.add(url)
-            unique_jobs.append(job)
-        collection.jobs = unique_jobs
-        return removed
 
     if not args.http:
         try:
@@ -564,18 +544,17 @@ Examples:
                     jobs = scraper.scrape_jora(search_term, location, pages)
                     collection.add_all(jobs)
             
-            # Filter out already-seen URLs BEFORE fetching details
+            # Deduplicate jobs (URL and Cross-Site)
             if len(collection) > 0:
-                original_count = len(collection)
-                collection.jobs = [job for job in collection.jobs if job.url and job.url not in seen_urls]
-                skipped_count = original_count - len(collection)
-                if skipped_count > 0:
-                    print(f"Skipping {skipped_count} jobs already seen in previous runs")
-
-            # Always deduplicate by URL (fuzzy variants, bundle overlap, and/or cross-source can repeat jobs)
-            duplicates_removed = _dedupe_collection_by_url()
-            if duplicates_removed > 0:
-                print(f"Removed {duplicates_removed} duplicate jobs (URL-based)")
+                print("\nDeduplicating jobs...")
+                unique_jobs, url_dupes, fuzzy_dupes = Deduplicator.deduplicate_jobs(
+                    collection.jobs, seen_urls=seen_urls
+                )
+                
+                print(f"  - Removed {url_dupes} duplicate jobs based on URL")
+                print(f"  - Removed {fuzzy_dupes} duplicate jobs based on Title/Company/Location (Cross-Site)")
+                
+                collection.jobs = unique_jobs
             
             # Fetch full job descriptions in browser mode (unless max_details == 0)
             skip_details = args.max_details == 0
@@ -619,24 +598,23 @@ Examples:
 
             if args.source in ["jora"]:
                 print("\nNote: Jora scraping is supported only in browser mode. Re-run without --http.")
+
+        # Deduplicate jobs (URL and Cross-Site)
+        if len(collection) > 0:
+            print("\nDeduplicating jobs...")
+            unique_jobs, url_dupes, fuzzy_dupes = Deduplicator.deduplicate_jobs(
+                collection.jobs, seen_urls=seen_urls
+            )
+            
+            print(f"  - Removed {url_dupes} duplicate jobs based on URL")
+            print(f"  - Removed {fuzzy_dupes} duplicate jobs based on Title/Company/Location (Cross-Site)")
+            
+            collection.jobs = unique_jobs
     
     print(f"\n{'='*60}")
     print(f"Total jobs found: {len(collection)}")
-    print(f"{'='*60}\n")
+    print(f"{ '='*60}\n")
     
-    # Filter out jobs whose URLs we've already seen (for HTTP mode - browser mode filters earlier)
-    if args.http and len(collection) > 0:
-        original_count = len(collection)
-        collection.jobs = [job for job in collection.jobs if job.url and job.url not in seen_urls]
-        skipped_count = original_count - len(collection)
-        if skipped_count > 0:
-            print(f"Skipping {skipped_count} jobs already seen in previous runs")
-
-    # Always deduplicate by URL in HTTP mode too (cross-page duplicates happen occasionally)
-    duplicates_removed = _dedupe_collection_by_url()
-    if duplicates_removed > 0:
-        print(f"Removed {duplicates_removed} duplicate jobs (URL-based)")
-
     # Export results
     if len(collection) > 0:
         # Apply scoring if enabled (after details fetch, before export)
@@ -663,20 +641,48 @@ Examples:
             pass
 
         # Create run folder and save individual job files
-        run_folder = collection.create_run_folder("scraped_data")
-        collection.save_all_jobs()
+        run_folder = JobStorage.create_run_folder(
+            "scraped_data", 
+            keywords=primary_keywords, 
+            location=location
+        )
+        # Update collection so it knows the run folder (if used elsewhere)
+        collection.run_folder = run_folder
+        
+        JobStorage.save_all_jobs(collection.jobs, run_folder)
         
         # Save combined CSV/JSON in the run folder
         if args.format == "csv":
-            collection.to_csv()
+            JobStorage.to_csv(
+                collection.jobs, 
+                os.path.join(run_folder, "all_jobs.csv")
+            )
         else:
-            collection.to_json()
+            JobStorage.to_json(
+                collection.jobs, 
+                os.path.join(run_folder, "all_jobs.json")
+            )
         
         # Always create compiled text file for AI analysis
         # Pass bundle metadata for enhanced header
-        collection.to_compiled_text()
-        collection.to_markdown(bundle_metadata=bundle_metadata)
-        collection.to_jsonl(bundle_metadata=bundle_metadata)
+        JobStorage.to_compiled_text(
+            collection.jobs,
+            os.path.join(run_folder, "compiled_jobs.txt"),
+            keywords=primary_keywords,
+            location=location
+        )
+        JobStorage.to_markdown(
+            collection.jobs,
+            os.path.join(run_folder, "compiled_jobs.md"),
+            keywords=primary_keywords,
+            location=location,
+            bundle_metadata=bundle_metadata
+        )
+        JobStorage.to_jsonl(
+            collection.jobs,
+            os.path.join(run_folder, "jobs.jsonl"),
+            metadata=bundle_metadata
+        )
 
         print(f"\n📁 All data saved to: {run_folder}")
         print(f"   📄 compiled_jobs.txt - Plain text for AI analysis")
@@ -692,7 +698,6 @@ Examples:
         
         try:
             from analyze_requirements import JobRequirementsAnalyzer
-            import os
 
             jsonl_file = os.path.join(run_folder, "jobs.jsonl")
             md_file = os.path.join(run_folder, "compiled_jobs.md")
