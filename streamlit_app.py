@@ -3324,37 +3324,37 @@ def render_run_progress():
     if _is_running():
         st.info("🔄 Scraping in progress...")
         
-        # Show spinner
-        with st.spinner("Running scraper... This may take a few minutes."):
-            # Display log tail
-            if log_file and Path(log_file).exists():
-                log_content = _read_log_tail(Path(log_file), max_lines=400)
-                if log_content.strip():
-                    with st.container(height=400):
-                        st.code(log_content, language="text")
-                else:
-                    st.caption("Waiting for output...")
+        # Display log tail
+        st.markdown("**Live Log Output:**")
+        if log_file and Path(log_file).exists():
+            log_content = _read_log_tail(Path(log_file), max_lines=100)
+            if log_content.strip():
+                with st.container(height=250):
+                    st.code(log_content, language="text")
             else:
-                st.caption("Waiting for log file...")
+                st.caption("Waiting for output...")
+        else:
+            st.caption("Waiting for log file...")
         
-        # Refresh button
-        if st.button("🔄 Refresh"):
-            st.rerun()
+        col_refresh, col_cancel = st.columns([1, 4])
+        with col_refresh:
+            if st.button("🔄 Refresh"):
+                st.rerun()
         
-        # Cancel button
-        if st.button("❌ Cancel Run"):
-            if process is not None:
-                process.terminate()
-            elif pid:
-                import psutil
-                try:
-                    psutil.Process(pid).terminate()
-                except Exception:
-                    pass
-            st.session_state.run_process = None
-            clear_run_state()
-            st.warning("Run cancelled.")
-            st.rerun()
+        with col_cancel:
+            if st.button("❌ Cancel Run"):
+                if process is not None:
+                    process.terminate()
+                elif pid:
+                    import psutil
+                    try:
+                        psutil.Process(pid).terminate()
+                    except Exception:
+                        pass
+                st.session_state.run_process = None
+                clear_run_state()
+                st.warning("Run cancelled.")
+                st.rerun()
 
         # Auto-refresh
         # IMPORTANT: Avoid `time.sleep()` + `st.rerun()` loops here.
@@ -3392,17 +3392,22 @@ def render_run_progress():
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            if latest_report and st.button("📊 Review Report", type="primary", use_container_width=True):
-                navigate_to(
-                    "reports",
-                    selected_run=str(latest_report),
-                    view_mode="overview",
-                    viewing_job_id=None,
-                    selected_filters={},
-                    filter_mode="any",
-                    search_text="",
+            if latest_report:
+                st.button(
+                    "📊 Review Report",
+                    type="primary",
+                    use_container_width=True,
+                    on_click=navigate_to,
+                    args=("reports",),
+                    kwargs={
+                        "selected_run": str(latest_report).replace(os.sep, "/"),
+                        "view_mode": "overview",
+                        "viewing_job_id": None,
+                        "selected_filters": {},
+                        "filter_mode": "any",
+                        "search_text": "",
+                    },
                 )
-                st.rerun()
         with col2:
             if st.button("📂 View Reports", use_container_width=True):
                 navigate_to("reports")
