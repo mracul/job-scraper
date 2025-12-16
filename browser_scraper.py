@@ -347,6 +347,15 @@ class BrowserScraper:
                 # Try to find job description based on source
                 full_desc = None
                 
+                if job.source == "seek":
+                    # Seek job description selectors
+                    for selector in [
+                        "[data-automation='jobAdDetails']",
+                        "[data-automation='jobDescription']", 
+                        ".job-description",
+                        "[class*='jobDescription']",
+                        "div[data-automation='jobAdDetails'] div"
+                    ]:
                         try:
                             desc_elem = self.driver.find_element(By.CSS_SELECTOR, selector)
                             html = desc_elem.get_attribute("innerHTML")
