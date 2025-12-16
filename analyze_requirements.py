@@ -64,6 +64,14 @@ def _maybe_extract_source_id(source: str, url: str) -> str | None:
     return None
 
 
+# Context keywords
+REQUIRED_WORDS = ['required', 'must have', 'essential', 'mandatory']
+PREFERRED_WORDS = ['preferred', 'desirable', 'nice to have', 'advantage', 'beneficial']
+BONUS_WORDS = ['bonus', 'plus', 'would be great', 'great if', 'helpful if']
+SECTION_REQUIRED = ['requirements', 'what we are looking for', 'essential', 'key requirements', 'skills and experience']
+SECTION_PREFERRED = ['desirable', 'nice to have', 'preferred']
+
+
 class JobRequirementsAnalyzer:
     """Analyzes job listings to extract commonly requested requirements."""
 
@@ -98,44 +106,37 @@ class JobRequirementsAnalyzer:
         # Other requirements
         self.other_requirements = OTHER_REQUIREMENTS
 
-    def _context_label_and_weight(self, match_start: int, match_end: int, job_text: str) -> tuple[str, float]:
-        """Determine context label and weight for a match based on its position and surrounding text.
+    def _context_label_and_weight(self, match_start: int, match_end: int, job_text: str, lower_job_text: str) -> tuple[str, float]:
+        """Determine context label and weight for a match based on its position and surrounding text. 
         
         Returns:
             (label, weight) where label is 'required', 'preferred', 'bonus', 'context'
             and weight is a multiplier (1.0 = required, 0.8 = preferred, 0.5 = bonus, 0.2 = context)
         """
         # Get window around match (100 chars before and after)
+        # Use lower_job_text which is already lowercased
         window_start = max(0, match_start - 100)
         window_end = min(len(job_text), match_end + 100)
-        window = job_text[window_start:window_end].lower()
+        window = lower_job_text[window_start:window_end]
         
         # Look back to start of the current line for bullet detection
+        # Use original job_text for finding newlines
         line_start = job_text.rfind('\n', 0, match_start) + 1
         line = job_text[line_start:match_start]
         has_bullet = bool(re.match(r'^\s*([-•*·]|\d+[\.\)])\s+', line))
         
-        # Define keywords and section hints
-        required_words = ['required', 'must have', 'essential', 'mandatory']
-        preferred_words = ['preferred', 'desirable', 'nice to have', 'advantage', 'beneficial']
-        bonus_words = ['bonus', 'plus', 'would be great', 'great if', 'helpful if']
-        
-        # Add section hints (strong)
-        section_required = ['requirements', 'what we are looking for', 'essential', 'key requirements', 'skills and experience']
-        section_preferred = ['desirable', 'nice to have', 'preferred']
-        
         # If window contains a requirement section header nearby, boost confidence
-        if any(s in window for s in section_required) and any(w in window for w in required_words):
+        if any(s in window for s in SECTION_REQUIRED) and any(w in window for w in REQUIRED_WORDS):
             return ('required', 1.0)
-        if any(s in window for s in section_preferred) and any(w in window for w in preferred_words):
+        if any(s in window for s in SECTION_PREFERRED) and any(w in window for w in PREFERRED_WORDS):
             return ('preferred', 0.8)
         
         # Otherwise fall back to keyword-only (more conservative)
-        if any(w in window for w in required_words):
+        if any(w in window for w in REQUIRED_WORDS):
             return ('required', 1.0)
-        if any(w in window for w in preferred_words):
+        if any(w in window for w in PREFERRED_WORDS):
             return ('preferred', 0.8)
-        if any(w in window for w in bonus_words):
+        if any(w in window for w in BONUS_WORDS):
             return ('bonus', 0.5)
         
         # If in bullet point, assume required unless contradicted
@@ -149,12 +150,12 @@ class JobRequirementsAnalyzer:
         self,
         term: str,
         matched: str,
-        job_text: str,
+        lower_job_text: str,
         category: str,
         match_start: int,
         match_end: int,
     ) -> bool:
-        """Apply term-specific gating logic to filter out false positives.
+        """Apply term-specific gating logic to filter out false positives. 
         
         Uses a local window around the match instead of the entire job text.
         
@@ -162,10 +163,9 @@ class JobRequirementsAnalyzer:
         """
         # Get local window around match (200 chars before and after for gating)
         window_start = max(0, match_start - 200)
-        window_end = min(len(job_text), match_end + 200)
-        window = job_text[window_start:window_end].lower()
+        window_end = min(len(lower_job_text), match_end + 200)
+        window = lower_job_text[window_start:window_end]
         term_lower = term.lower()
-        matched_lower = (matched or "").lower()
         
         # Education gating - avoid false positives in non-education contexts
         if category == 'education':
@@ -374,10 +374,9 @@ class JobRequirementsAnalyzer:
         return self.extract_jobs_from_markdown(filepath)
 
     def analyze_job(self, job_text: str) -> dict:
-        """Analyze a single job description for all requirement types.
+        """Analyze a single job description for all requirement types. 
         
-        Returns dict with 'presence' (simple counts) and 'weighted' (context-aware scores).
-        """
+        Returns dict with 'presence' (simple counts) and 'weighted' (context-aware scores)."""
         results = {
             'presence': {
                 'certifications': [],
@@ -403,24 +402,32 @@ class JobRequirementsAnalyzer:
             }
         }
         
+        # Pre-compute lowercase text for efficient window slicing
+        lower_job_text = job_text.lower()
+        
         # Helper to process a category
         def process_category(category_name: str, patterns_dict: dict):
             for name, pattern in patterns_dict.items():
                 matches = list(re.finditer(pattern, job_text, re.IGNORECASE))
                 for match in matches:
-                    # Apply term gating
+                    # Apply term gating using lower_job_text
                     if not self._passes_term_gate(
                         name,
                         match.group(0),
-                        job_text,
+                        lower_job_text,
                         category_name,
                         match.start(),
                         match.end(),
                     ):
                         continue
                     
-                    # Get context and weight
-                    label, weight = self._context_label_and_weight(match.start(), match.end(), job_text)
+                    # Get context and weight using lower_job_text
+                    label, weight = self._context_label_and_weight(
+                        match.start(), 
+                        match.end(), 
+                        job_text, 
+                        lower_job_text
+                    )
                     
                     # For certifications, track family bucket and optionally specific Microsoft codes
                     if category_name == 'certifications':
@@ -599,10 +606,10 @@ class JobRequirementsAnalyzer:
         self,
         analysis: dict,
         output_dir: str = None,
-        *,
+        *, 
         search_metadata: dict | None = None,
     ) -> str:
-        """Generate a comprehensive requirements report.
+        """Generate a comprehensive requirements report. 
         
         Args:
             analysis: Output from analyze_all_jobs().

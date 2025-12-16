@@ -16,6 +16,7 @@ import time
 import random
 import markdownify
 from models import Job
+from scraper_config import SEEK_SELECTORS, JORA_SELECTORS
 
 
 class BrowserScraper:
@@ -218,13 +219,7 @@ class BrowserScraper:
                 full_desc = None
 
                 if job.source == "seek":
-                    for selector in [
-                        "[data-automation='jobAdDetails']",
-                        "[data-automation='jobDescription']",
-                        ".job-description",
-                        "[class*='jobDescription']",
-                        "div[data-automation='jobAdDetails'] div",
-                    ]:
+                    for selector in SEEK_SELECTORS["full_description"]:
                         try:
                             desc_elem = driver.find_element(By.CSS_SELECTOR, selector)
                             html = desc_elem.get_attribute("innerHTML")
@@ -239,14 +234,7 @@ class BrowserScraper:
                             continue
 
                 elif job.source == "jora":
-                    for selector in [
-                        "#job-description-container",
-                        ".job-description",
-                        ".description",
-                        "[class*='description']",
-                        ".job-details",
-                        "#job-description",
-                    ]:
+                    for selector in JORA_SELECTORS["full_description"]:
                         try:
                             desc_elem = driver.find_element(By.CSS_SELECTOR, selector)
                             html = desc_elem.get_attribute("innerHTML")
@@ -348,14 +336,7 @@ class BrowserScraper:
                 full_desc = None
                 
                 if job.source == "seek":
-                    # Seek job description selectors
-                    for selector in [
-                        "[data-automation='jobAdDetails']",
-                        "[data-automation='jobDescription']", 
-                        ".job-description",
-                        "[class*='jobDescription']",
-                        "div[data-automation='jobAdDetails'] div"
-                    ]:
+                    for selector in SEEK_SELECTORS["full_description"]:
                         try:
                             desc_elem = self.driver.find_element(By.CSS_SELECTOR, selector)
                             html = desc_elem.get_attribute("innerHTML")
@@ -370,15 +351,7 @@ class BrowserScraper:
                             continue
                 
                 elif job.source == "jora":
-                    # Jora job description selectors
-                    for selector in [
-                        "#job-description-container",
-                        ".job-description",
-                        ".description",
-                        "[class*='description']",
-                        ".job-details",
-                        "#job-description"
-                    ]:
+                    for selector in JORA_SELECTORS["full_description"]:
                         try:
                             desc_elem = self.driver.find_element(By.CSS_SELECTOR, selector)
                             html = desc_elem.get_attribute("innerHTML")
@@ -431,7 +404,7 @@ class BrowserScraper:
                 try:
                     WebDriverWait(self.driver, 15).until(
                         EC.presence_of_element_located((By.CSS_SELECTOR, 
-                            "[data-automation='normalJob'], article[data-testid]"))
+                            SEEK_SELECTORS["job_card"]))
                     )
                 except TimeoutException:
                     print("    No job cards found - page may have loaded differently")
@@ -445,12 +418,12 @@ class BrowserScraper:
                 
                 # Find job cards
                 job_cards = self.driver.find_elements(By.CSS_SELECTOR, 
-                    "[data-automation='normalJob'], article[data-card-type='JobCard']")
+                    SEEK_SELECTORS["job_card"])
                 
                 if not job_cards:
                     # Try alternative selectors
                     job_cards = self.driver.find_elements(By.CSS_SELECTOR, 
-                        "article[data-testid], [data-job-id]")
+                        SEEK_SELECTORS["job_card_fallback"])
                 
                 page_jobs = 0
                 for card in job_cards:
@@ -471,7 +444,7 @@ class BrowserScraper:
                 # Check for next page
                 try:
                     next_button = self.driver.find_element(By.CSS_SELECTOR,
-                        "[data-automation='page-next'], a[aria-label='Next']")
+                        SEEK_SELECTORS["next_button"])
                     if 'disabled' in next_button.get_attribute('class') or '':
                         break
                 except NoSuchElementException:
@@ -488,7 +461,7 @@ class BrowserScraper:
         try:
             # Find title and link
             title_elem = None
-            for selector in ["[data-automation='jobTitle']", "a[data-automation='jobTitle']", "h3 a", "[data-testid='job-title'] a"]:
+            for selector in SEEK_SELECTORS["job_title"]:
                 try:
                     title_elem = card.find_element(By.CSS_SELECTOR, selector)
                     break
@@ -505,7 +478,7 @@ class BrowserScraper:
 
             # Find company
             company = "Not specified"
-            for selector in ["[data-automation='jobCompany']", "[data-testid='company-name']", "a[data-automation='jobCompany']"]:
+            for selector in SEEK_SELECTORS["company"]:
                 try:
                     company_elem = card.find_element(By.CSS_SELECTOR, selector)
                     company = company_elem.text.strip()
@@ -515,7 +488,7 @@ class BrowserScraper:
 
             # Find location
             location = "Not specified"
-            for selector in ["[data-automation='jobLocation']", "[data-testid='job-location']", "a[data-automation='jobLocation']"]:
+            for selector in SEEK_SELECTORS["location"]:
                 try:
                     location_elem = card.find_element(By.CSS_SELECTOR, selector)
                     location = location_elem.text.strip()
@@ -525,7 +498,7 @@ class BrowserScraper:
 
             # Find salary (if available)
             salary = None
-            for selector in ["[data-automation='jobSalary']", "[data-testid='job-salary']", "span[data-automation='jobSalary']"]:
+            for selector in SEEK_SELECTORS["salary"]:
                 try:
                     salary_elem = card.find_element(By.CSS_SELECTOR, selector)
                     salary = salary_elem.text.strip()
@@ -535,7 +508,7 @@ class BrowserScraper:
 
             # Find description
             description = ""
-            for selector in ["[data-automation='jobShortDescription']", "[data-testid='job-snippet']"]:
+            for selector in SEEK_SELECTORS["description_snippet"]:
                 try:
                     desc_elem = card.find_element(By.CSS_SELECTOR, selector)
                     description = desc_elem.text.strip()
@@ -545,7 +518,7 @@ class BrowserScraper:
 
             # Find listing date (e.g., "2d ago", "30d+ ago")
             date_posted = None
-            for selector in ["[data-automation='jobListingDate']", "[data-testid='listing-date']", "span[data-automation='jobListingDate']", "time", ".listing-date"]:
+            for selector in SEEK_SELECTORS["date_posted"]:
                 try:
                     date_elems = card.find_elements(By.CSS_SELECTOR, selector)
                     for elem in date_elems:
@@ -597,12 +570,13 @@ class BrowserScraper:
 
                 # Wait for results to appear
                 try:
+                    # Combine possible selectors for presence check
+                    selectors = JORA_SELECTORS["job_card"] + JORA_SELECTORS["job_link"]
+                    combined_selector = ", ".join(selectors)
+                    
                     WebDriverWait(self.driver, 15).until(
                         EC.presence_of_element_located(
-                            (
-                                By.CSS_SELECTOR,
-                                "a[href*='/job/'], article, [data-testid*='job'], [class*='job']",
-                            )
+                            (By.CSS_SELECTOR, combined_selector)
                         )
                     )
                 except TimeoutException:
@@ -661,13 +635,7 @@ class BrowserScraper:
         """Best-effort job card detection on Jora results pages."""
         # Prefer article-style cards; fall back to any container that includes a /job/ link.
         cards = []
-        for selector in [
-            "article",
-            "[data-testid*='job']",
-            "[class*='jobCard']",
-            "[class*='job-card']",
-            "[class*='result']",
-        ]:
+        for selector in JORA_SELECTORS["job_card"]:
             try:
                 found = self.driver.find_elements(By.CSS_SELECTOR, selector)
                 if found:
@@ -716,10 +684,7 @@ class BrowserScraper:
 
             # Title + link
             link = None
-            for selector in [
-                "a[href*='/job/']",
-                "a[href*='au.jora.com/job']",
-            ]:
+            for selector in JORA_SELECTORS["job_link"]:
                 try:
                     candidates = card.find_elements(By.CSS_SELECTOR, selector)
                     for c in candidates:
@@ -746,11 +711,7 @@ class BrowserScraper:
 
             # Company
             company = "Not specified"
-            for selector in [
-                "[data-testid*='company']",
-                "[class*='company']",
-                "a[href*='/company']",
-            ]:
+            for selector in JORA_SELECTORS["company"]:
                 try:
                     elem = card.find_element(By.CSS_SELECTOR, selector)
                     txt = (elem.text or "").strip()
@@ -762,10 +723,7 @@ class BrowserScraper:
 
             # Location
             loc = "Not specified"
-            for selector in [
-                "[data-testid*='location']",
-                "[class*='location']",
-            ]:
+            for selector in JORA_SELECTORS["location"]:
                 try:
                     elem = card.find_element(By.CSS_SELECTOR, selector)
                     txt = (elem.text or "").strip()
@@ -777,10 +735,7 @@ class BrowserScraper:
 
             # Salary (optional)
             salary = None
-            for selector in [
-                "[class*='salary']",
-                "[data-testid*='salary']",
-            ]:
+            for selector in JORA_SELECTORS["salary"]:
                 try:
                     elem = card.find_element(By.CSS_SELECTOR, selector)
                     txt = (elem.text or "").strip()
@@ -792,11 +747,7 @@ class BrowserScraper:
 
             # Description snippet (best-effort)
             description = ""
-            for selector in [
-                "[class*='snippet']",
-                "[class*='summary']",
-                "p",
-            ]:
+            for selector in JORA_SELECTORS["description_snippet"]:
                 try:
                     elem = card.find_element(By.CSS_SELECTOR, selector)
                     txt = (elem.text or "").strip()
@@ -808,13 +759,7 @@ class BrowserScraper:
 
             # Date posted (best-effort)
             date_posted = None
-            for selector in [
-                "[class*='date']",
-                "[data-testid*='date']",
-                "time",
-                "[class*='posted']",
-                "[class*='listing-date']",
-            ]:
+            for selector in JORA_SELECTORS["date_posted"]:
                 try:
                     elem = card.find_element(By.CSS_SELECTOR, selector)
                     txt = (elem.text or "").strip()
@@ -902,7 +847,7 @@ class BrowserScraper:
         current_page = _extract_page_number(current_url_norm) or 1
 
         # Highest-confidence selectors first.
-        for selector in ("a[rel='next']", "a[aria-label*='Next']", "a[title*='Next']"):
+        for selector in JORA_SELECTORS["next_button_candidates"]:
             for elem in _iter_elements(selector):
                 try:
                     href = elem.get_attribute("href")
@@ -996,7 +941,7 @@ def main():
     from datetime import datetime
     import argparse
     
-    parser = argparse.ArgumentParser(description="Browser-based job scraper for Seek and Jora")
+    parser = argparse.ArgumentParser(description="Browser-Based Job Scraper for Seek and Jora")
     parser.add_argument("--pages", "-p", type=int, default=3, help="Max pages to scrape per site")
     parser.add_argument("--source", "-s", choices=["all", "seek", "jora"], default="all", help="Site to scrape")
     parser.add_argument("--output", "-o", help="Output filename")
@@ -1020,7 +965,7 @@ def main():
     
     print(f"\n{'='*60}")
     print(f"Searching for '{keywords}' in '{location}'")
-    print(f"{'='*60}\n")
+    print(f"{ '='*60}\n")
     
     # Create scraper
     scraper = BrowserScraper(headless=not args.visible, delay=args.delay)
@@ -1044,7 +989,7 @@ def main():
     
     print(f"\n{'='*60}")
     print(f"Total jobs found: {len(collection)}")
-    print(f"{'='*60}\n")
+    print(f"{ '='*60}\n")
     
     # Generate output filename
     if not args.output:

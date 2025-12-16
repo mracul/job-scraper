@@ -211,7 +211,10 @@ job-scraper/
 ├── analyze_requirements.py  # Advanced requirements analyzer
 ├── seek_scraper.py          # HTTP-based Seek scraper (fallback)
 ├── jora_scraper.py          # HTTP-based Jora scraper
-├── models.py                # Data models and collections
+├── models.py                # Data models (Job, JobCollection)
+├── job_storage.py           # IO and file persistence service
+├── deduplication.py         # Advanced fuzzy and exact deduplication logic
+├── scraper_config.py        # Externalized CSS selectors and configuration
 ├── streamlit_app.py         # Visual dashboard
 ├── ui_core.py               # UI components and utilities
 ├── browse_report.py         # Report browsing utilities
