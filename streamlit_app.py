@@ -8,6 +8,7 @@ import streamlit.components.v1
 import pandas as pd
 import requests
 import json
+import re
 import os
 import time
 import subprocess
@@ -2882,15 +2883,45 @@ def render_job_explorer():
 
                 job_row = jobs_df.iloc[job_id - 1] if 0 <= job_id - 1 < len(jobs_df) else None
                 date_text = None
+                days_ago_text = ""
                 if job_row is not None:
                     date_value = job_row.get("date_posted")
                     if pd.notna(date_value) and date_value:
                         date_text = str(date_value)
+                        # Calculate days ago
+                        try:
+                            # Extract scraping date from folder name (format: ..._YYYYMMDD_HHMMSS)
+                            folder_name = run_path.name
+                            date_match = re.search(r'_(\d{8})_', folder_name)
+                            if date_match:
+                                scrape_date_str = date_match.group(1)
+                                scrape_date = datetime.strptime(scrape_date_str, "%Y%m%d")
+                                
+                                # Parse date_posted (e.g., "2d ago", "1w ago")
+                                days_ago = 0
+                                if "d ago" in date_value:
+                                    days_ago = int(re.search(r'(\d+)d ago', date_value).group(1))
+                                elif "w ago" in date_value:
+                                    days_ago = int(re.search(r'(\d+)w ago', date_value).group(1)) * 7
+                                elif "h ago" in date_value:
+                                    hours_ago = int(re.search(r'(\d+)h ago', date_value).group(1))
+                                    days_ago = hours_ago // 24
+                                
+                                posting_date = scrape_date - pd.Timedelta(days=days_ago)
+                                actual_days_ago = (datetime.now() - posting_date).days
+                                if actual_days_ago == 0:
+                                    days_ago_text = " (today)"
+                                elif actual_days_ago == 1:
+                                    days_ago_text = " (1 day ago)"
+                                else:
+                                    days_ago_text = f" ({actual_days_ago} days ago)"
+                        except (ValueError, AttributeError):
+                            pass  # Keep days_ago_text empty if parsing fails
 
                 col1, col2 = st.columns([4, 1])
 
                 with col1:
-                    if st.button(f"{title} — {company}", key=f"job_title_{job_id}"):
+                    if st.button(f"{title} — {company}{days_ago_text}", key=f"job_title_{job_id}"):
                         navigate_to(
                             "reports",
                             selected_run=st.session_state.selected_run,
