@@ -1,6 +1,94 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from pathlib import Path
+import json
+import copy
+
+
+# Settings management
+STATE_DIR = Path(__file__).parent / "state"
+SETTINGS_FILE = STATE_DIR / "ui_settings.json"
+
+DEFAULT_SETTINGS = {
+    "scraper": {
+        "pages": 3,
+        "source": "all",
+        "delay": 1.5,
+        "workers": 10,
+        "sequential": False,
+        "visible": False,
+        "max_details": None,
+        "fuzzy": False
+    },
+    "ui": {
+        "default_keywords": "help desk it",
+        "default_location": "Auburn NSW"
+    },
+    "ai": {
+        "model": "gpt-5-mini"
+    },
+    "bundles": {
+        "1️⃣ Core Entry-Level Catch-All (Daily)": [
+            "IT Support",
+            "Help Desk",
+            "Service Desk",
+        ],
+        "2️⃣ Analyst / Corporate Titles (Daily)": [
+            "Service Desk Analyst",
+            "IT Support Analyst",
+            "ICT Support",
+        ],
+        "3️⃣ Explicit Entry / Junior Signal (Daily)": [
+            "Entry Level IT",
+            "Junior IT",
+            "Level 1 IT",
+            "L1 Support",
+        ],
+        "4️⃣ Desktop / End-User Support (Every 2–3 Days)": [
+            "Desktop Support",
+            "End User Support",
+            "Technical Support",
+        ],
+        "5️⃣ L1–L2 Hybrid / Stretch Roles (Every 2–3 Days)": [
+            "Level 1/2 IT",
+            "Level 2 IT",
+            "Systems Support",
+        ],
+        "6️⃣ Microsoft Stack Signal (Weekly)": [
+            "Microsoft 365 Support",
+            "Active Directory Support",
+            "Azure Support",
+        ],
+    }
+}
+
+def _stable_json_dumps(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+def load_settings() -> dict:
+    """Load settings from JSON file, with defaults fallback."""
+    if SETTINGS_FILE.exists():
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            # Merge with defaults to ensure all keys exist
+            settings = copy.deepcopy(DEFAULT_SETTINGS)
+            for section in ["scraper", "ui", "ai", "bundles"]:
+                if section in saved:
+                    if isinstance(settings.get(section), dict) and isinstance(saved.get(section), dict):
+                        settings[section].update(saved[section])
+            return settings
+        except Exception:
+            pass
+    return copy.deepcopy(DEFAULT_SETTINGS)
+
+
+def save_settings(settings: dict) -> None:
+    """Save settings to JSON file."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
 
 
 def build_ai_summary_input(

@@ -65,61 +65,13 @@ def _maybe_extract_source_id(source: str, url: str) -> str | None:
 
 
 # Context keywords
-REQUIRED_WORDS = [
-    'required',
-    'must have',
-    'must',
-    'need',
-    'need to',
-    'minimum requirements',
-    'mandatory',
-    'essential',
-    'key criteria',
-    'selection criteria',
-    'you will have',
-    "you'll have",
-    'to succeed in this role',
-]
-PREFERRED_WORDS = [
-    'preferred',
-    'desirable',
-    'nice to have',
-    'advantage',
-    'beneficial',
-    'highly regarded',
-    'highly desirable',
-    'an advantage',
-    'would be advantageous',
-]
-BONUS_WORDS = [
-    'bonus',
-    'plus',
-    'a plus',
-    'would be great',
-    'great if',
-    'helpful if',
-]
-SECTION_REQUIRED = [
-    'requirements',
-    'minimum requirements',
-    'essential',
-    'mandatory',
-    'key requirements',
-    'skills required',
-    'skills and experience',
-    'what you will bring',
-    "what you'll bring",
-    'to succeed in this role',
-    'selection criteria',
-]
-SECTION_PREFERRED = [
-    'desirable',
-    'nice to have',
-    'preferred',
-    'highly regarded',
-    'highly desirable',
-    'advantageous',
-]
+REQUIRED_WORDS = ['required', 'must have', 'essential', 'mandatory']
+PREFERRED_WORDS = ['preferred', 'desirable', 'nice to have', 'advantage', 'beneficial']
+BONUS_WORDS = ['bonus', 'plus', 'would be great', 'great if', 'helpful if']
+SECTION_REQUIRED = ['requirements', 'what we are looking for', 'essential', 'key requirements', 'skills and experience']
+SECTION_PREFERRED = ['desirable', 'nice to have', 'preferred']
+
+
 class JobRequirementsAnalyzer:
     """Analyzes job listings to extract commonly requested requirements."""
 
@@ -154,19 +106,6 @@ class JobRequirementsAnalyzer:
         # Other requirements
         self.other_requirements = OTHER_REQUIREMENTS
 
-
-        # Pre-compile regex patterns once (major speed-up on large runs).
-        self._compiled_patterns = {
-            'certifications': [(n, re.compile(p, re.IGNORECASE)) for n, p in self.certification_patterns.items()],
-            'education': [(n, re.compile(p, re.IGNORECASE)) for n, p in self.education_patterns.items()],
-            'technical_skills': [(n, re.compile(p, re.IGNORECASE)) for n, p in self.technical_skills.items()],
-            'soft_skills': [(n, re.compile(p, re.IGNORECASE)) for n, p in self.soft_skills.items()],
-            'experience': [(n, re.compile(p, re.IGNORECASE)) for n, p in self.experience_patterns.items()],
-            'support_levels': [(n, re.compile(p, re.IGNORECASE)) for n, p in self.support_levels.items()],
-            'work_arrangements': [(n, re.compile(p, re.IGNORECASE)) for n, p in self.work_arrangements.items()],
-            'benefits': [(n, re.compile(p, re.IGNORECASE)) for n, p in self.benefits.items()],
-            'other_requirements': [(n, re.compile(p, re.IGNORECASE)) for n, p in self.other_requirements.items()],
-        }
     def _context_label_and_weight(self, match_start: int, match_end: int, job_text: str, lower_job_text: str) -> tuple[str, float]:
         """Determine context label and weight for a match based on its position and surrounding text. 
         
@@ -186,15 +125,12 @@ class JobRequirementsAnalyzer:
         line = job_text[line_start:match_start]
         has_bullet = bool(re.match(r'^\s*([-•*·]|\d+[\.\)])\s+', line))
         
-        # If a nearby section header suggests intent, boost confidence.
-        # (Section headers are often phrased without explicit "required/preferred" keywords.)
-        if any(s in window for s in SECTION_REQUIRED):
-            # If the same window strongly signals "preferred", respect that.
-            if any(w in window for w in PREFERRED_WORDS) and not any(w in window for w in REQUIRED_WORDS):
-                return ('preferred', 0.8)
+        # If window contains a requirement section header nearby, boost confidence
+        if any(s in window for s in SECTION_REQUIRED) and any(w in window for w in REQUIRED_WORDS):
             return ('required', 1.0)
-        if any(s in window for s in SECTION_PREFERRED):
+        if any(s in window for s in SECTION_PREFERRED) and any(w in window for w in PREFERRED_WORDS):
             return ('preferred', 0.8)
+        
         # Otherwise fall back to keyword-only (more conservative)
         if any(w in window for w in REQUIRED_WORDS):
             return ('required', 1.0)
@@ -469,30 +405,11 @@ class JobRequirementsAnalyzer:
         # Pre-compute lowercase text for efficient window slicing
         lower_job_text = job_text.lower()
         
-
-        # Track best per-term weighting per job to avoid multi-mention inflation
-        best_weighted = {k: {} for k in results['weighted'].keys()}
         # Helper to process a category
         def process_category(category_name: str, patterns_dict: dict):
-            # Prefer pre-compiled regex for speed; fall back to compiling on the fly.
-            compiled = getattr(self, "_compiled_patterns", {}).get(category_name)
-            if compiled is None:
-                compiled = [(n, re.compile(p, re.IGNORECASE)) for n, p in patterns_dict.items()]
-
-            def upsert_weighted(term: str, label: str, weight: float) -> None:
-                # Keep the strongest signal for this term within this job.
-                score = 1.0 * weight
-                prev = best_weighted[category_name].get(term)
-                if (prev is None) or (score > prev.get("score", 0)):
-                    best_weighted[category_name][term] = {
-                        "term": term,
-                        "weight": weight,
-                        "label": label,
-                        "score": score,
-                    }
-
-            for name, cre in compiled:
-                for match in cre.finditer(job_text):
+            for name, pattern in patterns_dict.items():
+                matches = list(re.finditer(pattern, job_text, re.IGNORECASE))
+                for match in matches:
                     # Apply term gating using lower_job_text
                     if not self._passes_term_gate(
                         name,
@@ -503,36 +420,64 @@ class JobRequirementsAnalyzer:
                         match.end(),
                     ):
                         continue
-
+                    
                     # Get context and weight using lower_job_text
                     label, weight = self._context_label_and_weight(
-                        match.start(),
-                        match.end(),
-                        job_text,
-                        lower_job_text,
+                        match.start(), 
+                        match.end(), 
+                        job_text, 
+                        lower_job_text
                     )
-
+                    
                     # For certifications, track family bucket and optionally specific Microsoft codes
-                    if category_name == "certifications":
+                    if category_name == 'certifications':
+                        # Add family bucket always
                         family = name
-                        if family not in results["presence"][category_name]:
-                            results["presence"][category_name].append(family)
-                        upsert_weighted(family, label, weight)
+                        if family not in results['presence'][category_name]:
+                            results['presence'][category_name].append(family)
+                        results['weighted'][category_name].append({
+                            'term': family,
+                            'weight': weight,
+                            'label': label,
+                            'score': 1.0 * weight,
+                        })
 
-                        # If it's a Microsoft code, record the specific code too (without blowing up families)
-                        raw = match.group(0).strip()
-                        code = raw.upper()
-                        if code in self.microsoft_cert_code_map:
-                            specific = f"{code} ({self.microsoft_cert_code_map[code]})"
-                            if specific not in results["presence"][category_name]:
-                                results["presence"][category_name].append(specific)
-                            upsert_weighted(specific, label, weight)
+                        # For Microsoft cert codes only, add specific code with friendly name
+                        matched_text = match.group(0).upper().strip()
+                        # Check if this is a Microsoft cert code (AZ-xxx, MS-xxx, etc.)
+                        if re.match(r'^(AZ|MS|MD|SC|PL|DP|MB|AI|AD|WS)-\d{3}$', matched_text):
+                            friendly = self.microsoft_cert_code_map.get(matched_text)
+                            if friendly:
+                                specific = f"{matched_text} ({friendly})"
+                            else:
+                                specific = matched_text
 
-                    else:
-                        if name not in results["presence"][category_name]:
-                            results["presence"][category_name].append(name)
-                        upsert_weighted(name, label, weight)
-
+                            if specific and specific not in results['presence'][category_name]:
+                                results['presence'][category_name].append(specific)
+                            results['weighted'][category_name].append({
+                                'term': specific,
+                                'weight': weight,
+                                'label': label,
+                                'score': 1.0 * weight,
+                            })
+                        continue
+                    
+                    # For non-certifications, use the pattern name as display name
+                    display_name = name
+                    
+                    # Add to presence (simple list)
+                    if display_name not in results['presence'][category_name]:
+                        results['presence'][category_name].append(display_name)
+                    
+                    # Add to weighted (with score)
+                    results['weighted'][category_name].append({
+                        'term': display_name,
+                        'weight': weight,
+                        'label': label,
+                        'score': 1.0 * weight  # Base score of 1.0, multiplied by weight
+                    })
+        
+        # Process all categories
         process_category('certifications', self.certification_patterns)
         process_category('education', self.education_patterns)
         process_category('technical_skills', self.technical_skills)
@@ -542,11 +487,7 @@ class JobRequirementsAnalyzer:
         process_category('work_arrangements', self.work_arrangements)
         process_category('benefits', self.benefits)
         process_category('other_requirements', self.other_requirements)
-
-        # Collapse best-weighted picks into the output (one entry per term per job).
-        for cat, best in best_weighted.items():
-            results['weighted'][cat] = list(best.values())
-
+        
         return results
 
     def analyze_all_jobs(self, jobs: list, *, dedupe: bool = True) -> dict:
@@ -691,89 +632,113 @@ class JobRequirementsAnalyzer:
             ""
         ]
         
+        # Add machine-readable summary block for AI consumption
+        block_lines = [
+            "--- SUMMARY_SIGNAL_BLOCK (FOR AI CONSUMPTION) ---",
+            f"TOTAL_JOBS={total_jobs}",
+            "",
+            "TOP_SIGNALS:"
+        ]
+        
+        # Top signals: top 3 technical skills
+        all_tech = presence_summary.get('technical_skills', {})
+        if all_tech:
+            top_3_tech = Counter(all_tech).most_common(3)
+            for skill, count in top_3_tech:
+                pct = (count / total_jobs) * 100
+                block_lines.append(f"- {skill} | {pct:.0f}%")
+        
+        # Signal concentrations
+        cert_count = len(presence_summary.get('certifications', {}))
+        tech_count = len(presence_summary.get('technical_skills', {}))
+        soft_count = len(presence_summary.get('soft_skills', {}))
+        
+        def get_concentration(count: int) -> str:
+            if count > 20:
+                return "HIGH"
+            elif count > 10:
+                return "MEDIUM"
+            else:
+                return "LOW"
+        
+        block_lines.extend([
+            "",
+            f"CERT_SIGNAL_CONCENTRATION={get_concentration(cert_count)}",
+            f"TECH_SIGNAL_CONCENTRATION={get_concentration(tech_count)}",
+            f"SOFT_SKILL_SIGNAL_CONCENTRATION={get_concentration(soft_count)}",
+            "",
+            "TRUNCATION:",
+            "- technical_skills: top 25 only",
+            "--- END SUMMARY_SIGNAL_BLOCK ---",
+            ""
+        ])
+        
+        report_lines.extend(block_lines)
+        
         # Helper to format section with both presence and weighted metrics
-        def format_section(title: str, presence_data: dict, weighted_data: dict, min_count: int = 1, max_items: int = 40):
+        def format_section(title: str, presence_data: dict, weighted_data: dict, min_count: int = 1):
             lines = [f"\n{'=' * 50}", f"{title}", "=" * 50]
             if not presence_data and not weighted_data:
                 lines.append("  No items found")
                 return lines
-
+            
             # Combine and sort by weighted score (primary), then presence count (secondary)
             combined_items = {}
             for item in set(presence_data.keys()) | set(weighted_data.keys()):
                 combined_items[item] = {
-                    "presence": float(presence_data.get(item, 0)),
-                    "weighted": float(weighted_data.get(item, 0)),
+                    'presence': presence_data.get(item, 0),
+                    'weighted': weighted_data.get(item, 0)
                 }
-
-            sorted_items = sorted(
-                combined_items.items(),
-                key=lambda x: (x[1]["weighted"], x[1]["presence"]),
-                reverse=True,
-            )
-
-            shown = 0
-            eligible = 0
+            
+            sorted_items = sorted(combined_items.items(), 
+                                key=lambda x: (x[1]['weighted'], x[1]['presence']), 
+                                reverse=True)
+            
             for item, metrics in sorted_items:
-                presence_count = int(metrics["presence"])
-                weighted_score = float(metrics["weighted"])
-                if presence_count < min_count:
-                    continue
-                eligible += 1
-
-                if shown >= max_items:
-                    break
-                shown += 1
-
-                presence_pct = (presence_count / total_jobs) * 100 if total_jobs else 0.0
-                avg_weight = weighted_score / presence_count if presence_count else 0.0
-
-                # Keep lines compact to reduce report size and UI overflow.
-                item_disp = item if len(item) <= 32 else (item[:29] + "…")
-
-                bar_len = min(20, int(presence_pct / 5))
-                bar = "█" * bar_len
-
-                lines.append(
-                    f"  {item_disp:32} {presence_count:3} jobs ({presence_pct:5.1f}%) | "
-                    f"Score: {weighted_score:6.1f} (avg: {avg_weight:.2f}) {bar}"
-                )
-
-            if eligible > shown:
-                lines.append(f"  … showing top {shown} of {eligible} items")
-
+                presence_count = metrics['presence']
+                weighted_score = metrics['weighted']
+                if presence_count >= min_count:
+                    presence_pct = (presence_count / total_jobs) * 100
+                    avg_weight = weighted_score / presence_count if presence_count > 0 else 0
+                    bar = "█" * int(presence_pct / 5)
+                    lines.append(f"  {item:35} {presence_count:3} jobs ({presence_pct:5.1f}%) | Score: {weighted_score:6.1f} (avg: {avg_weight:.2f}) {bar}")
             return lines
-
-
         
         # Add each section
-        report_lines.extend(format_section("CERTIFICATIONS", 
+        report_lines.extend(format_section("CERTIFICATIONS (Top 25 — long tail omitted)", 
                                          presence_summary['certifications'], 
-                                         weighted_summary['certifications'], max_items=35))
-        report_lines.extend(format_section("EDUCATION / QUALIFICATIONS", 
+                                         weighted_summary['certifications']))
+        report_lines.extend(format_section("EDUCATION / QUALIFICATIONS (Top 25 — long tail omitted)", 
                                          presence_summary['education'], 
-                                         weighted_summary['education'], max_items=20))
-        report_lines.extend(format_section("TECHNICAL SKILLS (Top 25)", 
+                                         weighted_summary['education']))
+        report_lines.extend(format_section("TECHNICAL SKILLS (Top 25 — long tail omitted)", 
                                          dict(Counter(presence_summary['technical_skills']).most_common(25)),
                                          dict(Counter(weighted_summary['technical_skills']).most_common(25))))
-        report_lines.extend(format_section("SOFT SKILLS", 
+        report_lines.extend(format_section("SOFT SKILLS (Top 25 — long tail omitted)", 
                                          presence_summary['soft_skills'], 
-                                         weighted_summary['soft_skills'], max_items=25))
-        report_lines.extend(format_section("EXPERIENCE REQUIREMENTS", 
+                                         weighted_summary['soft_skills']))
+        report_lines.extend(format_section("EXPERIENCE REQUIREMENTS (Top 25 — long tail omitted)", 
                                          presence_summary['experience'], 
-                                         weighted_summary['experience'], max_items=20))
-        report_lines.extend(format_section("SUPPORT LEVELS & ITSM", 
+                                         weighted_summary['experience']))
+        report_lines.extend(format_section("SUPPORT LEVELS & ITSM (Top 25 — long tail omitted)", 
                                          presence_summary.get('support_levels', {}), 
-                                         weighted_summary.get('support_levels', {}), max_items=15))
-        report_lines.extend(format_section("WORK ARRANGEMENTS", 
+                                         weighted_summary.get('support_levels', {})))
+        report_lines.extend(format_section("WORK ARRANGEMENTS (Top 25 — long tail omitted)", 
                                          presence_summary.get('work_arrangements', {}), 
-                                         weighted_summary.get('work_arrangements', {}), max_items=12))
-        report_lines.extend(format_section("BENEFITS & PERKS", 
+                                         weighted_summary.get('work_arrangements', {})))
+        report_lines.extend(format_section("BENEFITS & PERKS (Top 25 — long tail omitted)", 
                                          presence_summary.get('benefits', {}), 
-                                         weighted_summary.get('benefits', {}), max_items=15))
-        report_lines.extend(format_section("OTHER REQUIREMENTS", 
+                                         weighted_summary.get('benefits', {})))
+        report_lines.extend(format_section("OTHER REQUIREMENTS (Top 25 — long tail omitted)", 
                                          presence_summary['other_requirements'], 
-                                         weighted_summary['other_requirements'], max_items=20))
+                                         weighted_summary['other_requirements']))
+        
+        # Add truncation note
+        report_lines.extend([
+            "",
+            "Note: Only the most frequent signals are shown to reduce noise.",
+            ""
+        ])
         
         # Key insights
         report_lines.extend([

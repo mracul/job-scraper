@@ -1,52 +1,172 @@
 from pathlib import Path
 import time
 import streamlit as st
+import os
+import requests
+import re
 from markdown import markdown as md_to_html
 
 from ai_summary_core import (
     AI_SUMMARY_SYSTEM_PROMPT,
     AI_SUMMARY_MAX_OUTPUT_TOKENS,
-    _load_cached_ai_summary,
-    _save_cached_ai_summary,
     compute_input_hash,
     resolve_cache_state,
 )
+from ui.io_cache import _load_cached_ai_summary, _save_cached_ai_summary
+from ui.utils import split_tldr
+from ui_core import load_settings, _stable_json_dumps
 
 # UI-only constants
 AI_MAX_N = 50
 AI_MAX_COMPILED_N = 75
 
-# --- AI Summary UI Block ---
-def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate: bool = True) -> None:
-    import hashlib, re
-    from datetime import datetime
-    # ===== SETTINGS / HASH BASIS =====
-    from .streamlit_app import load_settings, _stable_json_dumps
+def _dedent_accidental_codeblocks(md: str) -> str:
+    """
+    Remove leading 4 spaces that cause unintended markdown code blocks.
+    Does NOT alter fenced code blocks ```...```.
+    """
+    if not md:
+        return md
+
+    out = []
+    in_fence = False
+    for line in md.splitlines():
+        if re.match(r"^\s*```", line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+
+        if not in_fence and line.startswith("    "):
+            out.append(line[4:])  # remove 4 leading spaces
+        else:
+            out.append(line)
+
+    return "\n".join(out)
+
+def _get_openai_api_key() -> str | None:
+    """Get OpenAI API key from environment or Streamlit secrets."""
+    # Prioritize environment variable (useful for local dev/overrides)
+    env_value = os.getenv("OPENAI_API_KEY")
+    if env_value:
+        return env_value
+
+    for key_name in ("OPENAI_API_KEY", "openai_api_key"):
+        try:
+            value = st.secrets.get(key_name)
+        except Exception:
+            value = None
+        if value:
+            return str(value)
+    
+    return None
+
+def _fallback_summary_from_input(ai_input: dict) -> str:
+    """Simple fallback when AI generation fails - just show error message."""
+    total_jobs = ai_input.get("total_jobs", 0)
+    return (
+        f"⚠️ **AI summary generation failed.** Unable to analyze {total_jobs} job listings.\n\n"
+        "Please check your OpenAI API key in Settings or try again later."
+    )
+
+def _generate_ai_summary_text(ai_input: dict) -> str:
+    api_key = _get_openai_api_key()
+    if not api_key:
+        raise RuntimeError("Missing OPENAI_API_KEY. Add it to .streamlit/secrets.toml or env var.")
+
     settings = load_settings()
     ai_model = settings.get("ai", {}).get("model", "gpt-5-mini")
 
-    cache_basis = {
-        "ai_input": ai_input,
+    # Prefer sending the human-readable analysis text (requirements_analysis.txt) plus metadata.
+    # Backward-compatibility: some callers still pass structured JSON (categories/top terms).
+    if isinstance(ai_input, dict) and isinstance(ai_input.get("analysis_text"), str):
+        meta = ai_input.get("meta")
+        user_prompt = (
+            "Here is a job requirements analysis report for the user's search. "
+            "Use ONLY the report text and the metadata block to produce the requested summary.\n\n"
+            f"METADATA_JSON={_stable_json_dumps(meta if isinstance(meta, dict) else {})}\n\n"
+            f"REQUIREMENTS_ANALYSIS_TXT=\n{ai_input.get('analysis_text','').strip()}"
+        )
+    else:
+        user_prompt = (
+            "Here is aggregated job-requirement data (counts and consolidated percentages) for the user's search. "
+            "Use it to produce the requested summary.\n\n"
+            f"DATA_JSON={_stable_json_dumps(ai_input)}"
+        )
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
         "model": ai_model,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": AI_SUMMARY_SYSTEM_PROMPT}]},
+            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+        ],
         "max_output_tokens": AI_SUMMARY_MAX_OUTPUT_TOKENS,
-        "system_prompt": AI_SUMMARY_SYSTEM_PROMPT,
     }
 
-    from ai_summary_core import _load_cached_ai_summary, _save_cached_ai_summary, _hash_payload
+    url = "https://api.openai.com/v1/responses"
+    backoff_seconds = 1.0
+    resp = None
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=120,
+            )
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(backoff_seconds)
+                backoff_seconds *= 2
+                continue
+            raise RuntimeError(f"OpenAI request failed: {exc}")
+
+        if resp.status_code in {429, 500, 502, 503, 504} and attempt < 2:
+            time.sleep(backoff_seconds)
+            backoff_seconds *= 2
+            continue
+
+        if resp.status_code >= 400:
+            raise RuntimeError(f"OpenAI API error ({resp.status_code}): {resp.text[:400]}")
+        break
+
+    if resp is None:
+        raise RuntimeError(f"OpenAI request failed: {last_error}")
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI API returned non-JSON response: {str(exc)[:200]}")
+    parts: list[str] = []
+    for out in data.get("output", []) or []:
+        for content in out.get("content", []) or []:
+            if content.get("type") == "output_text" and content.get("text"):
+                parts.append(content.get("text"))
+    text = "".join(parts).strip()
+    if not text:
+        # Fallback for unexpected response shapes
+        text = (data.get("output_text") or "").strip()
+    if not text:
+        text = _fallback_summary_from_input(ai_input)
+    return text
+
+# --- AI Summary UI Block ---
+def render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate: bool = True) -> None:
+    import hashlib, re
+    from datetime import datetime
+    # ===== SETTINGS / HASH BASIS =====
+    from ui_core import load_settings
+    settings = load_settings()
+    ai_model = settings.get("ai", {}).get("model", "gpt-5-mini")
+
+    from ai_summary_core import _load_cached_ai_summary, _save_cached_ai_summary
     cached = _load_cached_ai_summary(cache_path)
-    input_hash = _hash_payload(cache_basis)
+    input_hash = compute_input_hash(ai_input, ai_model, AI_SUMMARY_MAX_OUTPUT_TOKENS, AI_SUMMARY_SYSTEM_PROMPT)
 
     # ===== CACHE STATE (single source of truth) =====
-    cached_text = None
-    cache_status = None  # "current" | "outdated" | None
-
-    if cached:
-        if cached.get("input_hash") == input_hash:
-            cached_text = cached.get("summary")
-            cache_status = "current"
-        elif cached.get("summary"):
-            cached_text = cached.get("summary")
-            cache_status = "outdated"
+    cached_text, cache_status = resolve_cache_state(cached, input_hash)
 
     auto_key = f"ai_auto_{cache_path.name}_{input_hash[:8]}"
     inflight_key = f"ai_inflight_{cache_path.name}_{input_hash[:8]}"
@@ -68,17 +188,8 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
             },
         )
 
-    def split_tldr(md: str):
-        if not md:
-            return "", ""
-        m = re.search(r"(?ms)^#{2,3}\s+TL;DR[^\n]*\n.*?(?=^##\s+|\Z)", md)
-        if not m:
-            return "", md
-        tldr = m.group(0).strip()
-        rest = (md[:m.start()] + md[m.end():]).strip()
-        return tldr, rest
-
     def render_markdown_scroll(md: str, *, height_px: int = 260) -> None:
+        md = _dedent_accidental_codeblocks(md or "")
         html = md_to_html(
             md or "_No further details._",
             extensions=["extra", "tables", "sane_lists", "nl2br"],
@@ -118,7 +229,9 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
             summary_text = None
 
     # ===== CSS (ALWAYS injected once; not inside if-branches) =====
-    st.markdown(r"""
+    if not st.session_state.get("_ai_summary_css_injected"):
+        st.session_state["_ai_summary_css_injected"] = True
+        st.markdown(r"""
 <style>
 /* ===== Pulse animation ===== */
 @keyframes pulseGlow {
@@ -151,11 +264,31 @@ div.stButton > button {
   overflow: auto;
   max-width: 100%;
   width: 100%;
-  padding: 0.25rem 0;
+
+  /* prevent margin-collapsing + stop headings "floating" upward */
+  display: flow-root;
+
+  /* give content a tiny top/bottom buffer */
+  padding: 0.5rem 0;
+
   background: transparent;
   border: 0;
   border-radius: 0;
   box-shadow: none;
+}
+
+/* tame markdown heading spacing inside scroll container */
+.ai-summary .ai-scroll h1,
+.ai-summary .ai-scroll h2,
+.ai-summary .ai-scroll h3,
+.ai-summary .ai-scroll h4{
+  margin: 0.6rem 0 0.25rem 0;
+  line-height: 1.15;
+}
+
+/* ensure first element doesn't add extra top gap */
+.ai-summary .ai-scroll > :first-child{
+  margin-top: 0 !important;
 }
 
 .ai-summary .ai-scroll,
@@ -190,6 +323,26 @@ div.stButton > button {
   overflow-wrap: anywhere !important;
   word-break: break-word !important;
 }
+
+/* === AI SUMMARY MARKDOWN HARDENING === */
+.ai-summary h1,
+.ai-summary h2,
+.ai-summary h3,
+.ai-summary h4{
+  margin-top: 1rem !important;
+  margin-bottom: 0.4rem !important;
+  line-height: 1.15;
+}
+
+/* Never allow headings to overlap previous content */
+.ai-summary h1::before,
+.ai-summary h2::before,
+.ai-summary h3::before{
+  content: "";
+  display: block;
+  height: 0;
+  margin-top: 0.5rem;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -218,12 +371,15 @@ div.stButton > button {
             )
 
         with right:
-            b1, b2, b3 = st.columns(3)
+            b1, b2, b3 = st.columns(3, vertical_alignment="center")
 
             # 1) Generate / Reset (pulses while generating)
             with b1:
                 pulse_class = "ai-pulse-button" if is_generating else ""
-                st.markdown(f"<div class='{pulse_class}'>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='{pulse_class}' style='display:flex;align-items:center;justify-content:center;height:100%;'>",
+                    unsafe_allow_html=True
+                )
 
                 if is_generating:
                     if st.button(
@@ -263,12 +419,16 @@ div.stButton > button {
 
             # 2) Clear cache
             with b2:
+                st.markdown(
+                    "<div style='display:flex;align-items:center;justify-content:center;height:100%;'>",
+                    unsafe_allow_html=True
+                )
                 disabled = not bool(cached_text)
                 if st.button(
                     "🗑️",
                     use_container_width=True,
-                    key=f"clr_{cache_path.name}_{input_hash[:8]}",
-                    help="Clear cached summary",
+                    key=f"del_{cache_path.name}_{input_hash[:8]}",
+                    help="Delete cached summary",
                     disabled=disabled,
                 ):
                     try:
@@ -276,15 +436,20 @@ div.stButton > button {
                     except Exception:
                         pass
                     st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
 
             # 3) Expand
             with b3:
+                st.markdown(
+                    "<div style='display:flex;align-items:center;justify-content:center;height:100%;'>",
+                    unsafe_allow_html=True
+                )
                 disabled = not bool(summary_text)
                 if st.button(
                     "⤢",
                     use_container_width=True,
-                    key=f"exp_{cache_path.name}_{input_hash[:8]}",
-                    help="Expand AI summary",
+                    key=f"expand_{cache_path.name}_{input_hash[:8]}",
+                    help="Toggle expanded view",
                     disabled=disabled,
                 ):
                     if hasattr(st, "dialog"):
@@ -295,13 +460,14 @@ div.stButton > button {
                     else:
                         with st.expander("AI Summary (expanded)", expanded=True):
                             st.markdown(summary_text or "")
+                st.markdown("</div>", unsafe_allow_html=True)
 
         # Body (NO st.info; TL;DR shown if present)
         if summary_text:
             tldr_md, rest_md = split_tldr(summary_text)
             if tldr_md:
-                st.markdown(tldr_md)
-                st.markdown("---")
+                render_markdown_scroll(tldr_md, height_px=100)
+                st.markdown("<div style='height:0.75rem'></div>", unsafe_allow_html=True)
             render_markdown_scroll(rest_md, height_px=260)
         else:
             st.markdown("_No summary yet._")

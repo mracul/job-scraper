@@ -24,10 +24,23 @@ from collections import defaultdict
 import plotly.express as px
 
 # Import the AI summary UI block from the new module
-from ai_summary_ui import _render_ai_summary_block
+from ai_summary_ui import render_ai_summary_block
 
 from ui_core import build_ai_summary_input as _ui_build_ai_summary_input
 from ui_core import merge_analyses as _ui_merge_analyses
+
+from ui.utils import split_tldr, _truncate_text, _hash_payload
+from ui.io_cache import (
+    _load_cached_ai_summary,
+    _save_cached_ai_summary,
+    _load_analysis_cached,
+    load_analysis,
+    _load_text_file_cached,
+    load_requirements_analysis_txt,
+    _load_jobs_csv_cached,
+    load_jobs_csv,
+    _get_run_search_meta,
+)
 
 from compiled_report_store import (
     build_compiled_report_payload,
@@ -37,24 +50,6 @@ from compiled_report_store import (
     load_compiled_report,
     save_compiled_report_atomic,
 )
-
-
-def split_tldr(md: str):
-    """
-    Extract the TL;DR section (## TL;DR ...) and return (tldr_md, rest_md).
-    Safe no-op if TL;DR not present.
-    """
-    if not md:
-        return "", ""
-
-    # Match any H2 or H3 line that begins with "TL;DR" (handles em-dash, en-dash, colon, etc.)
-    m = re.search(r"(?ms)^#{2,3}\s+TL;DR[^\n]*\n.*?(?=^##\s+|\Z)", md)
-    if not m:
-        return "", md
-
-    tldr = m.group(0).strip()
-    rest = (md[:m.start()] + md[m.end():]).strip()
-    return tldr, rest
 
 
 def render_markdown_scroll(md: str, *, height_px: int = 260) -> None:
@@ -69,175 +64,28 @@ def render_markdown_scroll(md: str, *, height_px: int = 260) -> None:
 # Configuration & Constants
 # ============================================================================
 
-SCRAPED_DATA_DIR = Path(__file__).parent / "scraped_data"
-STATE_DIR = Path(__file__).parent / "state"
-SETTINGS_FILE = STATE_DIR / "ui_settings.json"
-RUN_STATE_FILE = STATE_DIR / "active_run.json"
-LOGS_DIR = Path(__file__).parent / "logs"
-OVERVIEW_DIR = STATE_DIR / "overviews"
-OUTPUTS_DIR = Path(__file__).parent / "outputs"
-
-DEFAULT_SETTINGS = {
-    "scraper": {
-        "pages": 3,
-        "source": "all",
-        "delay": 1.5,
-        "workers": 10,
-        "sequential": False,
-        "visible": False,
-        "max_details": None,
-        "fuzzy": False
-    },
-    "ui": {
-        "default_keywords": "help desk it",
-        "default_location": "Auburn NSW"
-    },
-    "ai": {
-        "model": "gpt-5-mini"
-    },
-    "bundles": {
-        "1️⃣ Core Entry-Level Catch-All (Daily)": [
-            "IT Support",
-            "Help Desk",
-            "Service Desk",
-        ],
-        "2️⃣ Analyst / Corporate Titles (Daily)": [
-            "Service Desk Analyst",
-            "IT Support Analyst",
-            "ICT Support",
-        ],
-        "3️⃣ Explicit Entry / Junior Signal (Daily)": [
-            "Entry Level IT",
-            "Junior IT",
-            "Level 1 IT",
-            "L1 Support",
-        ],
-        "4️⃣ Desktop / End-User Support (Every 2–3 Days)": [
-            "Desktop Support",
-            "End User Support",
-            "Technical Support",
-        ],
-        "5️⃣ L1–L2 Hybrid / Stretch Roles (Every 2–3 Days)": [
-            "Level 1/2 IT",
-            "Level 2 IT",
-            "Systems Support",
-        ],
-        "6️⃣ Microsoft Stack Signal (Weekly)": [
-            "Microsoft 365 Support",
-            "Active Directory Support",
-            "Azure Support",
-        ],
-    }
-}
-
-CATEGORY_LABELS = {
-    "certifications": "🏆 Certifications",
-    "education": "🎓 Education",
-    "technical_skills": "💻 Technical Skills",
-    "soft_skills": "🤝 Soft Skills",
-    "experience": "📅 Experience",
-    "support_levels": "🎯 Support Levels",
-    "work_arrangements": "🏢 Work Arrangements",
-    "benefits": "🎁 Benefits",
-    "other_requirements": "📋 Other Requirements"
-}
-DETAIL_FETCH_OPTIONS = [
-    ("Fetch all job details", None),
-    ("Skip job details (only job cards)", 0),
-]
-DETAIL_FETCH_LABELS = [label for label, _ in DETAIL_FETCH_OPTIONS]
-DETAIL_FETCH_VALUES = {label: value for label, value in DETAIL_FETCH_OPTIONS}
-FILTER_WIDGET_KEYS = [f"filter_{cat_key}" for cat_key in CATEGORY_LABELS]
-
-
-def _get_openai_api_key() -> str | None:
-    """Get OpenAI API key from environment or Streamlit secrets."""
-    # Prioritize environment variable (useful for local dev/overrides)
-    env_value = os.getenv("OPENAI_API_KEY")
-    if env_value:
-        return env_value
-
-    for key_name in ("OPENAI_API_KEY", "openai_api_key"):
-        try:
-            value = st.secrets.get(key_name)
-        except Exception:
-            value = None
-        if value:
-            return str(value)
-    
-    return None
-
-
-def _stable_json_dumps(obj) -> str:
-    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _hash_payload(payload) -> str:
-    raw = _stable_json_dumps(payload).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
-
-
-def _load_cached_ai_summary(cache_path: Path) -> dict | None:
-    """Load cached AI summary with robust error handling."""
-    if not cache_path.exists():
-        return None
-    try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # Validate that it's a dict with required fields
-        if isinstance(data, dict) and "summary" in data and "input_hash" in data:
-            return data
-        return None
-    except (json.JSONDecodeError, IOError, OSError):
-        # If file is corrupted, remove it so it can be regenerated
-        try:
-            cache_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return None
-
-
-def _save_cached_ai_summary(cache_path: Path, data: dict) -> None:
-    """Save cached AI summary with robust error handling."""
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        # Write to a temporary file first, then rename for atomicity
-        temp_path = cache_path.with_suffix(".tmp")
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        temp_path.replace(cache_path)
-    except Exception:
-        # If saving fails, try the old method
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass  # Silently fail if caching is not possible
-
-
-def _get_run_search_meta(run_path: Path) -> tuple[str | None, str | None]:
-    """Try to read search keywords/location from compiled_jobs.md header."""
-    md_path = run_path / "compiled_jobs.md"
-    if not md_path.exists():
-        return None, None
-    keywords = None
-    location = None
-    try:
-        with open(md_path, "r", encoding="utf-8", errors="replace") as f:
-            for _ in range(60):
-                line = f.readline()
-                if not line:
-                    break
-                if line.startswith("**Search Keywords:**"):
-                    keywords = line.replace("**Search Keywords:**", "").strip().rstrip("  ")
-                elif line.startswith("**Search Location:**"):
-                    location = line.replace("**Search Location:**", "").strip().rstrip("  ")
-                if keywords and location:
-                    break
-    except Exception:
-        return None, None
-    return keywords, location
+from ui_core import STATE_DIR, SETTINGS_FILE, DEFAULT_SETTINGS, _stable_json_dumps, load_settings, save_settings
+from ui.constants import (
+    SCRAPED_DATA_DIR,
+    RUN_STATE_FILE,
+    LOGS_DIR,
+    OVERVIEW_DIR,
+    OUTPUTS_DIR,
+    CATEGORY_LABELS,
+    DETAIL_FETCH_OPTIONS,
+    DETAIL_FETCH_LABELS,
+    DETAIL_FETCH_VALUES,
+    FILTER_WIDGET_KEYS,
+    AI_SUMMARY_MAX_OUTPUT_TOKENS,
+    AI_SUMMARY_TOP_N_SINGLE,
+    AI_SUMMARY_TOP_N_COMPILED,
+    CUTOFF_PRESETS,
+    CUTOFF_LABELS,
+    CUTOFF_VALUES,
+    HALFLIFE_PRESETS,
+    HALFLIFE_LABELS,
+    HALFLIFE_VALUES,
+)
 
 
 def _build_ai_summary_input(
@@ -259,344 +107,12 @@ def _build_ai_summary_input(
     )
 
 
-AI_SUMMARY_SYSTEM_PROMPT = """
-
-# IT Support / Help Desk Job Market Interpreter
-
-**Role Definition & Output Contract**
-
-You are a **career coach** helping people enter or progress in **IT Support and Help Desk roles**, using **aggregated job market data** to guide efficient, evidence-based decision-making.
-
-You will be given:
-
-* A **plain-text requirements analysis report** generated from job listings
-    (includes categories, tags, counts, and percentages)
-* A small **metadata JSON block**
-    (search terms, location, run scope)
-
-Your task is to **interpret the report** and translate it into **practical, market-aligned guidance** on where a candidate should focus their effort.
-
----
-
-Ordering rule (STRICT):
-Output sections in this exact order:
-1) TL;DR — Market Snapshot
-2) Market Signals & Direction
-3) Certifications & Credentials
-4) Technical Skill Focus
-5) Professional & Soft Skills
-6) Practical Development Guidance
-7) Search Context
-
-If you cannot complete all sections due to length, keep TL;DR first and drop lower-priority sections (starting from Search Context upward).
-
----
-
-## Core Principles
-
-* **Use only the provided data**
-
-  * Do **not** introduce technologies, certifications, tools, or requirements that do not appear in the tags.
-* **No hidden inference**
-
-  * Do **not** infer “typical” expectations or industry norms unless directly supported by the data.
-* **Percentages explain priority**
-
-  * Use percentages to explain **relative demand and importance**, not to dump statistics.
-* **Pattern over inventory**
-
-  * Focus on **signals, trade-offs, and implications**, not exhaustive lists.
-* **Grounded optimism**
-
-  * Be realistic and encouraging, but **avoid certainty or guarantees**.
-
----
-
-## Output Discipline (Strict)
-
-* **Depth over breadth**
-
-  * Identify the **top 3–5 strongest market signals** only.
-  * Explicitly deprioritise weaker or fringe signals.
-* **No repetition**
-
-  * Do not restate the same implication across multiple sections.
-* **No multi-phase roadmaps**
-
-  * Do not introduce staged or long-term plans unless explicitly requested.
-* **Bounded examples**
-
-  * Use only a **few representative examples per theme**, always tied to percentages.
-* **Truncation awareness**
-
-  * If a category is truncated, explicitly note that **only top signals are visible**.
-
----
-
-## TL;DR — Market Snapshot (Required)
-
-Provide a **concise executive summary** intended for quick scanning or UI display.
-
-**Rules for this section:**
-
-* **3–5 bullet points only**
-* Each bullet must:
-
-  * Reflect a **strong signal** from the data
-  * Use **plain language**
-  * Avoid listing tools exhaustively
-* No percentages unless they materially strengthen the point
-* No advice phrased as guarantees
-
-**Purpose:**
-
-* Give the reader a **high-confidence orientation** before detail
-* Serve as a **standalone AI summary** without replacing deeper sections
-
-This section should be readable **in isolation**.
-
----
-
-Ordering rule (STRICT):
-Output sections in this exact order:
-1) TL;DR — Market Snapshot
-2) Market Signals & Direction
-3) Certifications & Credentials
-4) Technical Skill Focus
-5) Professional & Soft Skills
-6) Practical Development Guidance
-7) Search Context
-
-If you cannot complete all sections due to length, keep TL;DR first and drop lower-priority sections (starting from Search Context upward).
-
----
-
-## 1. Market Signals & Direction
-
-Explain:
-
-* What the data suggests about **overall employer priorities**
-* Whether demand is **concentrated around a few strong signals** or spread across many weaker ones
-* What this implies about **how narrowly or broadly candidates should focus**
-
-Avoid listing technologies here—focus on **direction and signal strength**.
-
----
-
-## 2. Certifications & Credentials
-
-Cover:
-
-* Which certifications stand out **by relative demand**
-* How a candidate might **sensibly prioritise** them (e.g., first vs later) based on:
-
-  * Frequency
-  * Alignment with entry-level or support responsibilities
-* Frame certifications as **signals to employers**, not proof of competence
-
-Do **not** recommend certifications that do not appear in the data.
-
----
-
-## 3. Technical Skill Focus
-
-Identify:
-
-* The **most frequently appearing technical skills or tools**
-* What those signals imply about the **types of problems the role is expected to solve**
-
-  * e.g. account access issues, device configuration, endpoint troubleshooting, basic networking
-
-Focus on **problem domains**, not tool mastery narratives.
-
----
-
-## 4. Professional & Soft Skills
-
-Explain:
-
-* How soft skills appear **relative to technical requirements**
-* What this suggests about:
-
-  * Day-to-day work expectations
-  * Hiring and screening priorities
-
-Keep interpretation grounded in **relative frequency**, not opinion.
-
----
-
-## 5. Practical Development Guidance
-
-Translate the strongest signals into **concrete but bounded actions**:
-
-* What to **prioritise learning or practising first**
-* What kinds of **hands-on evidence** best align with the data
-
-  * e.g. documented troubleshooting, ticket examples, lab notes
-* What to **emphasise in resumes or interviews**, based on signal strength
-
-Avoid:
-
-* Long-term career speculation
-* Pathways not supported by the data
-* Over-engineering or exhaustive prep lists
-
----
-
-## 6. Search Context
-
-Briefly relate:
-
-* The original **search terms and location**
-* How they may explain or influence the observed demand patterns
-
-Keep this short and contextual.
-
----
-
-## Intent
-
-Your goal is **not** to prescribe a single path.
-
-Your goal is to help the reader:
-
-* Allocate **time and energy efficiently**
-* Focus on what the **market is demonstrably asking for**
-* Make **informed trade-offs**, not chase completeness
-
----
-If analysis approaches verbosity limits, prioritise TL;DR clarity and omit lower-priority sections rather than exceeding output bounds.
-"""
-
-AI_SUMMARY_MAX_OUTPUT_TOKENS = 2000
-AI_SUMMARY_TOP_N_SINGLE = 50 #SINGLE SCRAPE RUN
-AI_SUMMARY_TOP_N_COMPILED = 75 #COMPILED SCRAPE RUNS
-
-
-def _fallback_summary_from_input(ai_input: dict) -> str:
-    """Simple fallback when AI generation fails - just show error message."""
-    total_jobs = ai_input.get("total_jobs", 0)
-    return (
-        f"⚠️ **AI summary generation failed.** Unable to analyze {total_jobs} job listings.\n\n"
-        "Please check your OpenAI API key in Settings or try again later."
-    )
-
-
-def _generate_ai_summary_text(ai_input: dict) -> str:
-    api_key = _get_openai_api_key()
-    if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY. Add it to .streamlit/secrets.toml or env var.")
-
-    settings = load_settings()
-    ai_model = settings.get("ai", {}).get("model", "gpt-5-mini")
-
-    # Prefer sending the human-readable analysis text (requirements_analysis.txt) plus metadata.
-    # Backward-compatibility: some callers still pass structured JSON (categories/top terms).
-    if isinstance(ai_input, dict) and isinstance(ai_input.get("analysis_text"), str):
-        meta = ai_input.get("meta")
-        user_prompt = (
-            "Here is a job requirements analysis report for the user's search. "
-            "Use ONLY the report text and the metadata block to produce the requested summary.\n\n"
-            f"METADATA_JSON={_stable_json_dumps(meta if isinstance(meta, dict) else {})}\n\n"
-            f"REQUIREMENTS_ANALYSIS_TXT=\n{ai_input.get('analysis_text','').strip()}"
-        )
-    else:
-        user_prompt = (
-            "Here is aggregated job-requirement data (counts and consolidated percentages) for the user's search. "
-            "Use it to produce the requested summary.\n\n"
-            f"DATA_JSON={_stable_json_dumps(ai_input)}"
-        )
-
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": ai_model,
-        "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": AI_SUMMARY_SYSTEM_PROMPT}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-        ],
-        "max_output_tokens": AI_SUMMARY_MAX_OUTPUT_TOKENS,
-    }
-
-    url = "https://api.openai.com/v1/responses"
-    backoff_seconds = 1.0
-    resp = None
-    last_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            resp = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=120,
-            )
-        except requests.RequestException as exc:
-            last_error = exc
-            if attempt < 2:
-                time.sleep(backoff_seconds)
-                backoff_seconds *= 2
-                continue
-            raise RuntimeError(f"OpenAI request failed: {exc}")
-
-        if resp.status_code in {429, 500, 502, 503, 504} and attempt < 2:
-            time.sleep(backoff_seconds)
-            backoff_seconds *= 2
-            continue
-
-        if resp.status_code >= 400:
-            raise RuntimeError(f"OpenAI API error ({resp.status_code}): {resp.text[:400]}")
-        break
-
-    if resp is None:
-        raise RuntimeError(f"OpenAI request failed: {last_error}")
-
-    try:
-        data = resp.json()
-    except Exception as exc:
-        raise RuntimeError(f"OpenAI API returned non-JSON response: {str(exc)[:200]}")
-    parts: list[str] = []
-    for out in data.get("output", []) or []:
-        for content in out.get("content", []) or []:
-            if content.get("type") == "output_text" and content.get("text"):
-                parts.append(content.get("text"))
-    text = "".join(parts).strip()
-    if not text:
-        # Fallback for unexpected response shapes
-        text = (data.get("output_text") or "").strip()
-    if not text:
-        text = _fallback_summary_from_input(ai_input)
-    return text
-
-
 
 
 
 # ============================================================================
 # Settings Persistence
 # ============================================================================
-
-def load_settings() -> dict:
-    """Load settings from JSON file, with defaults fallback."""
-    if SETTINGS_FILE.exists():
-        try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            # Merge with defaults to ensure all keys exist
-            settings = copy.deepcopy(DEFAULT_SETTINGS)
-            for section in ["scraper", "ui", "ai", "bundles"]:
-                if section in saved:
-                    if isinstance(settings.get(section), dict) and isinstance(saved.get(section), dict):
-                        settings[section].update(saved[section])
-            return settings
-        except Exception:
-            pass
-    return copy.deepcopy(DEFAULT_SETTINGS)
-
-
-def save_settings(settings: dict) -> None:
-    """Save settings to JSON file."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=2)
 
 
 def _read_run_state_raw() -> dict | None:
@@ -768,60 +284,6 @@ def list_runs() -> list[dict]:
     return runs
 
 
-@st.cache_data
-def _load_analysis_cached(analysis_file: str, mtime: float) -> dict | None:
-    """Cached JSON loader keyed on (path, mtime) to avoid stale UI data."""
-    try:
-        with open(analysis_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-def load_analysis(run_path: Path) -> dict | None:
-    """Load requirements_analysis.json for a run."""
-    analysis_file = run_path / "requirements_analysis.json"
-    if not analysis_file.exists():
-        return None
-    try:
-        mtime = float(analysis_file.stat().st_mtime)
-    except Exception:
-        mtime = 0.0
-    return _load_analysis_cached(str(analysis_file), mtime)
-
-
-@st.cache_data
-def _load_text_file_cached(path: str, mtime: float) -> str | None:
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except Exception:
-        return None
-
-
-def load_requirements_analysis_txt(run_path: Path) -> str | None:
-    """Load requirements_analysis.txt for a run (human-readable analysis)."""
-    txt_file = run_path / "requirements_analysis.txt"
-    if not txt_file.exists():
-        return None
-    try:
-        mtime = float(txt_file.stat().st_mtime)
-    except Exception:
-        mtime = 0.0
-    return _load_text_file_cached(str(txt_file), mtime)
-
-
-def _truncate_text(text: str, *, max_chars: int, suffix: str) -> str:
-    if not isinstance(text, str):
-        return ""
-    if max_chars <= 0:
-        return ""
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - len(suffix)] + suffix
-
-
 def _build_ai_text_payload(*, analysis_text: str, meta: dict) -> dict:
     """Build the AI input payload for summary generation.
 
@@ -831,27 +293,6 @@ def _build_ai_text_payload(*, analysis_text: str, meta: dict) -> dict:
         "analysis_text": str(analysis_text or ""),
         "meta": meta if isinstance(meta, dict) else {},
     }
-
-
-@st.cache_data
-def _load_jobs_csv_cached(csv_file: str, mtime: float) -> pd.DataFrame | None:
-    """Cached CSV loader keyed on (path, mtime) to avoid stale UI data."""
-    try:
-        return pd.read_csv(csv_file)
-    except Exception:
-        return None
-
-
-def load_jobs_csv(run_path: Path) -> pd.DataFrame | None:
-    """Load all_jobs.csv as DataFrame."""
-    csv_file = run_path / "all_jobs.csv"
-    if not csv_file.exists():
-        return None
-    try:
-        mtime = float(csv_file.stat().st_mtime)
-    except Exception:
-        mtime = 0.0
-    return _load_jobs_csv_cached(str(csv_file), mtime)
 
 
 # ============================================================================
@@ -888,6 +329,8 @@ def init_session_state():
         st.session_state.delete_modal_open = False
     if "last_url_state" not in st.session_state:
         st.session_state.last_url_state = None
+    if "nav_seq" not in st.session_state:
+        st.session_state.nav_seq = 0
     if "nav_origin" not in st.session_state:
         # Used to control where "Back" returns (e.g. compiled overview).
         st.session_state.nav_origin = None
@@ -1254,15 +697,14 @@ def _get_query_params() -> dict:
 
 def _set_query_params(params: dict) -> None:
     """Compatibility wrapper for setting query params across Streamlit versions."""
+    clean = {k: str(v) for k, v in params.items() if v is not None}
+
     try:
         st.query_params.clear()
-        for k, v in params.items():
-            if v is None:
-                continue
-            st.query_params[k] = str(v)
+        # Single batch update is more stable than key-by-key assignment in Streamlit 1.52.x
+        st.query_params.update(clean)
     except Exception:
-        # experimental API expects lists
-        st.experimental_set_query_params(**{k: str(v) for k, v in params.items() if v is not None})
+        st.experimental_set_query_params(**clean)
 
 
 def snapshot_state() -> dict:
@@ -1279,7 +721,7 @@ def snapshot_state() -> dict:
     }
 
 
-def _encode_state_for_url(state: dict) -> dict:
+def _encode_state_for_url(state: dict, extra: dict | None = None) -> dict:
     """Encode navigation state into a URL-safe query params dict."""
     params: dict[str, str] = {
         "page": state.get("page") or "reports",
@@ -1308,6 +750,13 @@ def _encode_state_for_url(state: dict) -> dict:
             params["compiled"] = json.dumps(compiled_runs, separators=(",", ":"), ensure_ascii=False)
         except Exception:
             pass
+
+    # Extra params (e.g. nav marker)
+    if extra:
+        for k, v in extra.items():
+            if v is None:
+                continue
+            params[k] = str(v)
 
     return params
 
@@ -1338,7 +787,8 @@ def _apply_state_from_url() -> None:
         st.session_state.page = page
     if view:
         st.session_state.view_mode = view
-    st.session_state.selected_run = run
+    if run is not None:
+        st.session_state.selected_run = run
 
     if job is not None:
         try:
@@ -1368,11 +818,13 @@ def _apply_state_from_url() -> None:
                 st.session_state.compiled_runs = [str(p) for p in parsed]
         except Exception:
             pass
+    else:
+        st.session_state.compiled_runs = []
 
 
-def _sync_url_with_state() -> None:
-    """Push current state to URL (creates browser history entries for back/forward)."""
-    desired = _encode_state_for_url(snapshot_state())
+def _sync_url_with_state(force: bool = False, extra_params: dict | None = None) -> None:
+    """Push current state to URL. Use force=True to guarantee a history step."""
+    desired = _encode_state_for_url(snapshot_state(), extra=extra_params)
     current = _get_query_params()
 
     # Normalize current params to str->str
@@ -1383,7 +835,9 @@ def _sync_url_with_state() -> None:
         else:
             normalized[k] = str(v)
 
-    if normalized != {k: str(v) for k, v in desired.items()}:
+    desired_norm = {k: str(v) for k, v in desired.items()}
+
+    if force or normalized != desired_norm:
         _set_query_params(desired)
 
 
@@ -1474,7 +928,12 @@ def navigate_to(page: str, **kwargs):
         _clear_report_filter_widgets()
 
     _normalize_navigation_state()
-    _sync_url_with_state()
+
+    # Force a unique URL each explicit navigation (ensures browser history steps)
+    st.session_state.nav_seq = st.session_state.get("nav_seq", 0) + 1
+    _sync_url_with_state(force=True, extra_params={"nav": str(st.session_state.nav_seq)})
+
+    st.rerun()
 
 
 # ============================================================================
@@ -1644,26 +1103,6 @@ def render_reports_page():
 # ============================================================================
 # Page: Overview
 # ============================================================================
-
-CUTOFF_PRESETS = [
-    ("7d", 7),
-    ("30d", 30),
-    ("90d", 90),
-    ("180d", 180),
-    ("365d", 365),
-]
-CUTOFF_LABELS = [label for label, _ in CUTOFF_PRESETS]
-CUTOFF_VALUES = {label: value for label, value in CUTOFF_PRESETS}
-
-HALFLIFE_PRESETS = [
-    ("7d", 7),
-    ("14d", 14),
-    ("30d", 30),
-    ("60d", 60),
-    ("90d", 90),
-]
-HALFLIFE_LABELS = [label for label, _ in HALFLIFE_PRESETS]
-HALFLIFE_VALUES = {label: value for label, value in HALFLIFE_PRESETS}
 
 
 def _render_market_context_bars(weighted_summary: dict, effective_jobs: float) -> None:
@@ -1916,7 +1355,7 @@ def render_overview_page():
             top_n_per_category=int(top_n),
         )
         ai_cache = OVERVIEW_DIR / f"ai_{_hash_payload(params)[:16]}.json"
-        _render_ai_summary_block(cache_path=ai_cache, ai_input=ai_input, auto_generate=False)
+        render_ai_summary_block(cache_path=ai_cache, ai_input=ai_input, auto_generate=False)
 
 
 def render_report_list():
@@ -2267,7 +1706,7 @@ def render_compiled_overview():
     )
     compiled_key = hashlib.sha256("|".join(sorted(p.name for p in run_paths)).encode("utf-8")).hexdigest()[:16]
     cache_path = STATE_DIR / f"compiled_ai_summary_{compiled_key}.json"
-    _render_ai_summary_block(cache_path=cache_path, ai_input=ai_input)
+    render_ai_summary_block(cache_path=cache_path, ai_input=ai_input)
 
     st.markdown("---")
 
@@ -2593,7 +2032,7 @@ def render_report_overview():
             top_n_per_category=AI_SUMMARY_TOP_N_SINGLE,
         )
     cache_path = run_path / "ai_summary.json"
-    _render_ai_summary_block(cache_path=cache_path, ai_input=ai_input)
+    render_ai_summary_block(cache_path=cache_path, ai_input=ai_input)
 
     st.markdown("---")
     
@@ -3702,28 +3141,17 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    # Inject JS to detect browser back/forward and reload page
-    st.components.v1.html(
-        """
-        <script>
-        window.addEventListener('popstate', function(event) {
-            // Browser back/forward detected - reload to apply new URL state
-            window.location.reload();
-        });
-        </script>
-        """,
-        height=0,
-    )
-    
     init_session_state()
 
-    # Apply URL navigation state first so browser/mouse back-forward works.
-    # We compare current URL params with last known state to detect external changes.
-    current_url_state = str(_get_query_params())
-    if st.session_state.last_url_state is None or st.session_state.last_url_state != current_url_state:
+    # URL-change detection (replaces popstate reload)
+    params = _get_query_params()
+    params_str = json.dumps(params, sort_keys=True)
+
+    if st.session_state.get("last_url_state") != params_str:
         _apply_state_from_url()
+        st.session_state.last_url_state = params_str
         _normalize_navigation_state()
-        st.session_state.last_url_state = current_url_state
+        st.rerun()
 
     render_sidebar()
     
@@ -3739,9 +3167,8 @@ def main():
     else:
         render_reports_page()
 
-    # Keep URL in sync with final state.
-    _sync_url_with_state()
-    st.session_state.last_url_state = str(_get_query_params())
+    # Optional passive sync (only if you need it)
+    _sync_url_with_state(force=False)
 
 
 if __name__ == "__main__":
