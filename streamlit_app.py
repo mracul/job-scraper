@@ -284,15 +284,7 @@ def list_runs() -> list[dict]:
     return runs
 
 
-def _build_ai_text_payload(*, analysis_text: str, meta: dict) -> dict:
-    """Build the AI input payload for summary generation.
 
-    The report text is the authoritative representation of the categorical data.
-    """
-    return {
-        "analysis_text": str(analysis_text or ""),
-        "meta": meta if isinstance(meta, dict) else {},
-    }
 
 
 # ============================================================================
@@ -1338,24 +1330,31 @@ def render_overview_page():
     # AI Summary (collapsed)
     # ─────────────────────────────────────────────────────────────────────────
     with st.expander("🤖 AI Summary (Interpretation)", expanded=False):
-        # Build AI input from weighted summary
+        # Build AI bundle from weighted summary
         # Convert weighted_summary to simple counts for AI input
         simple_summary = {}
         for cat_key, terms_map in weighted_summary.items():
             simple_summary[cat_key] = {term: int(data.get("weighted_count", 0)) for term, data in terms_map.items()}
 
-        ai_input = _build_ai_summary_input(
-            total_jobs=int(effective_jobs),
-            summary=simple_summary,
-            search_context={
+        overview_data = {
+            "total_jobs": int(effective_jobs),
+            "summary": simple_summary,
+            "search": {
                 "window": f"Last {cutoff_days} days (half-life {half_life_days}d)",
                 "runs": [r.get("name") for r in runs_used],
-            },
-            scope_label=f"overview_{cutoff_days}d_hl{half_life_days}d",
-            top_n_per_category=int(top_n),
+            }
+        }
+
+        from ai.ai_payloads import build_ai_bundle
+        from ui.constants import CATEGORY_LABELS
+        bundle = build_ai_bundle(
+            scope=f"overview_{cutoff_days}d_hl{half_life_days}d",
+            overview=overview_data,
+            limits={"top_n_per_category": int(top_n)},
+            category_labels=CATEGORY_LABELS,
         )
-        ai_cache = OVERVIEW_DIR / f"ai_{_hash_payload(params)[:16]}.json"
-        render_ai_summary_block(cache_path=ai_cache, ai_input=ai_input, auto_generate=False)
+        ai_cache = OVERVIEW_DIR / f"ai_{bundle['fingerprint']}.json"
+        render_ai_summary_block(cache_path=ai_cache, ai_input=bundle, auto_generate=False)
 
 
 def render_report_list():
@@ -1693,7 +1692,10 @@ def render_compiled_overview():
         suffix="\n\n[TRUNCATED: combined requirements_analysis.txt exceeded limit]",
     )
 
-    ai_input = _build_ai_text_payload(
+    from ai.ai_payloads import build_ai_bundle
+    from ui.constants import CATEGORY_LABELS
+    bundle = build_ai_bundle(
+        scope="compiled",
         analysis_text=combined_txt,
         meta={
             "scope": "compiled",
@@ -1703,10 +1705,12 @@ def render_compiled_overview():
             "companies": int(unique_companies or 0),
             "compiled_reports": int(len(run_paths)),
         },
+        limits={"top_n_per_category": 25},  # Default for compiled
+        category_labels=CATEGORY_LABELS,
     )
     compiled_key = hashlib.sha256("|".join(sorted(p.name for p in run_paths)).encode("utf-8")).hexdigest()[:16]
     cache_path = STATE_DIR / f"compiled_ai_summary_{compiled_key}.json"
-    render_ai_summary_block(cache_path=cache_path, ai_input=ai_input)
+    render_ai_summary_block(cache_path=cache_path, ai_input=bundle)
 
     st.markdown("---")
 
@@ -2002,8 +2006,12 @@ def render_report_overview():
     # AI summary (single report)
     keywords, location = _get_run_search_meta(run_path)
     txt = load_requirements_analysis_txt(run_path)
+    from ai.ai_payloads import build_ai_bundle
+    from ui.constants import CATEGORY_LABELS, AI_SUMMARY_TOP_N_SINGLE
+
     if txt and txt.strip():
-        ai_input = _build_ai_text_payload(
+        bundle = build_ai_bundle(
+            scope="single",
             analysis_text=_truncate_text(
                 txt.strip(),
                 max_chars=80_000,
@@ -2017,22 +2025,28 @@ def render_report_overview():
                 "total_jobs": int(total_jobs or 0),
                 "companies": int(unique_companies or 0),
             },
+            limits={"top_n_per_category": AI_SUMMARY_TOP_N_SINGLE},
+            category_labels=CATEGORY_LABELS,
         )
     else:
         # Fallback for older runs missing requirements_analysis.txt
-        ai_input = _build_ai_summary_input(
-            total_jobs=total_jobs,
-            summary=summary,
-            search_context={
+        overview_data = {
+            "total_jobs": total_jobs,
+            "summary": summary,
+            "search": {
                 "run": run_path.name,
                 "keywords": keywords,
                 "location": location,
-            },
-            scope_label="single",
-            top_n_per_category=AI_SUMMARY_TOP_N_SINGLE,
+            }
+        }
+        bundle = build_ai_bundle(
+            scope="single",
+            overview=overview_data,
+            limits={"top_n_per_category": AI_SUMMARY_TOP_N_SINGLE},
+            category_labels=CATEGORY_LABELS,
         )
     cache_path = run_path / "ai_summary.json"
-    render_ai_summary_block(cache_path=cache_path, ai_input=ai_input)
+    render_ai_summary_block(cache_path=cache_path, ai_input=bundle)
 
     st.markdown("---")
     

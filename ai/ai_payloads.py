@@ -6,6 +6,9 @@ import hashlib
 import json
 
 
+MAX_EXCERPT_CHARS = 12000  # safe default; tweak later
+
+
 @dataclass
 class AIPayload:
     """Container for AI API request components."""
@@ -143,6 +146,8 @@ def _build_ui_model_and_truncation(
             included_categories += 1
 
         truncated = len(items) > len(top_items)
+        if truncated:
+            categories_truncated = True
         categories_payload[cat_key] = {
             "label": cat_label,
             "total_unique": total_terms,
@@ -189,44 +194,44 @@ def _build_llm_input(
     analysis_json: Optional[Dict[str, Any]],
     ui_model: UIModel,
     meta: Optional[Dict[str, Any]],
+    limits: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Build the input payload sent to the LLM."""
-    if analysis_text:
-        # Prefer human-readable analysis text
-        user_prompt = (
-            "Here is a job requirements analysis report for the user's search. "
-            "Use ONLY the report text and the metadata block to produce the requested summary.\n\n"
-            f"METADATA_JSON={json.dumps(meta if isinstance(meta, dict) else {}, indent=2)}\n\n"
-            f"REQUIREMENTS_ANALYSIS_TXT=\n{analysis_text.strip()}"
-        )
-    else:
-        # Fallback to structured JSON data
-        user_prompt = (
-            "Here is aggregated job-requirement data (counts and consolidated percentages) for the user's search. "
-            "Use it to produce the requested summary.\n\n"
-            f"DATA_JSON={json.dumps(ui_model.__dict__, indent=2)}"
-        )
+    """
+    Build compact, structured LLM input.
+    Prefer ui_model.categories + meta + limits.
+    Include a capped excerpt of analysis_text only as fallback context.
+    """
+
+    excerpt = ""
+    if isinstance(analysis_text, str):
+        t = analysis_text.strip()
+        if t:
+            excerpt = t[:MAX_EXCERPT_CHARS]
 
     return {
-        "user_prompt": user_prompt,
-        "system_prompt": None,  # Will be set when building actual API payload
-        "context": {
-            "scope": ui_model.scope,
-            "total_jobs": ui_model.total_jobs,
-            "search_context": ui_model.search_context,
-        }
+        "meta": meta if isinstance(meta, dict) else {},
+        "scope": {
+            "label": getattr(ui_model, "scope", "") or "",
+        },
+        "limits": limits if isinstance(limits, dict) else {},
+        # machine-readable block the LLM should rely on
+        "ui_model": {
+            "scope": getattr(ui_model, "scope", ""),
+            "total_jobs": int(getattr(ui_model, "total_jobs", 0) or 0),
+            "search_context": getattr(ui_model, "search_context", {}) or {},
+            "categories": getattr(ui_model, "categories", {}) or {},
+        },
+        # optional excerpt fallback (kept small)
+        "analysis_text_excerpt": excerpt,
+        # optional legacy
+        "analysis_json": analysis_json if isinstance(analysis_json, dict) else None,
     }
 
 
 def _generate_fingerprint(llm_input: Dict[str, Any]) -> str:
-    """Generate a hash fingerprint for caching based on LLM input."""
-    # Create a stable string representation for hashing
-    fingerprint_data = {
-        "user_prompt": llm_input.get("user_prompt", ""),
-        "context": llm_input.get("context", {}),
-    }
-    fingerprint_str = json.dumps(fingerprint_data, sort_keys=True, separators=(',', ':'))
-    return hashlib.sha256(fingerprint_str.encode('utf-8')).hexdigest()[:16]
+    """Generate a stable hash fingerprint for caching based on LLM input."""
+    blob = json.dumps(llm_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def build_openai_headers(api_key: str) -> Dict[str, str]:

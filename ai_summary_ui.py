@@ -68,7 +68,7 @@ def _fallback_summary_from_input(ai_input: dict) -> str:
         "Please check your OpenAI API key in Settings or try again later."
     )
 
-def _generate_ai_summary_text(ai_input: dict) -> str:
+def _generate_ai_summary_text(llm_input: dict) -> str:
     api_key = _get_openai_api_key()
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY. Add it to .streamlit/secrets.toml or env var.")
@@ -76,22 +76,23 @@ def _generate_ai_summary_text(ai_input: dict) -> str:
     settings = load_settings()
     ai_model = settings.get("ai", {}).get("model", "gpt-5-mini")
 
-    # Prefer sending the human-readable analysis text (requirements_analysis.txt) plus metadata.
-    # Backward-compatibility: some callers still pass structured JSON (categories/top terms).
-    if isinstance(ai_input, dict) and isinstance(ai_input.get("analysis_text"), str):
-        meta = ai_input.get("meta")
-        user_prompt = (
-            "Here is a job requirements analysis report for the user's search. "
-            "Use ONLY the report text and the metadata block to produce the requested summary.\n\n"
-            f"METADATA_JSON={_stable_json_dumps(meta if isinstance(meta, dict) else {})}\n\n"
-            f"REQUIREMENTS_ANALYSIS_TXT=\n{ai_input.get('analysis_text','').strip()}"
-        )
-    else:
-        user_prompt = (
-            "Here is aggregated job-requirement data (counts and consolidated percentages) for the user's search. "
-            "Use it to produce the requested summary.\n\n"
-            f"DATA_JSON={_stable_json_dumps(ai_input)}"
-        )
+    # Build structured prompt from llm_input
+    meta = llm_input.get("meta", {})
+    limits = llm_input.get("limits", {})
+    ui = llm_input.get("ui_model", {})
+    excerpt = llm_input.get("analysis_text_excerpt", "")
+
+    user_prompt = (
+        "You are given job requirement signals derived from job listings.\n"
+        "Use ONLY the provided JSON blocks.\n"
+        "If analysis_text_excerpt is present, treat it as a fallback excerpt only.\n\n"
+        f"METADATA_JSON={_stable_json_dumps(meta)}\n\n"
+        f"LIMITS_JSON={_stable_json_dumps(limits)}\n\n"
+        f"SUMMARY_SIGNAL_BLOCK_JSON={_stable_json_dumps(ui)}\n\n"
+    )
+
+    if excerpt:
+        user_prompt += f"REPORT_TEXT_EXCERPT=\n{excerpt}\n"
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
@@ -163,7 +164,17 @@ def render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate: 
 
     from ai_summary_core import _load_cached_ai_summary, _save_cached_ai_summary
     cached = _load_cached_ai_summary(cache_path)
-    input_hash = compute_input_hash(ai_input, ai_model, AI_SUMMARY_MAX_OUTPUT_TOKENS, AI_SUMMARY_SYSTEM_PROMPT)
+
+    # ===== BUNDLE vs LEGACY DETECTION =====
+    is_bundle = isinstance(ai_input, dict) and isinstance(ai_input.get("llm_input"), dict)
+    llm_input = ai_input["llm_input"] if is_bundle else ai_input
+    ui_model = ai_input.get("ui_model") if is_bundle else None
+
+    # ===== CACHE KEY =====
+    if is_bundle and ai_input.get("fingerprint"):
+        input_hash = str(ai_input["fingerprint"])
+    else:
+        input_hash = compute_input_hash(llm_input, ai_model, AI_SUMMARY_MAX_OUTPUT_TOKENS, AI_SUMMARY_SYSTEM_PROMPT)
 
     # ===== CACHE STATE (single source of truth) =====
     cached_text, cache_status = resolve_cache_state(cached, input_hash)
@@ -217,7 +228,7 @@ def render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate: 
         st.session_state[inflight_key] = True
         st.session_state[inflight_started_key] = time.time()
         try:
-            summary_text = _generate_ai_summary_text(ai_input)
+            summary_text = _generate_ai_summary_text(llm_input)
             _save(summary_text)
             st.session_state[inflight_key] = False
             st.session_state.pop(inflight_started_key, None)
@@ -370,6 +381,22 @@ div.stButton > button {
                 unsafe_allow_html=True,
             )
 
+        # ===== INPUTS & LIMITS ROW =====
+        if is_bundle:
+            ui = ai_input.get("ui_model")
+            llm = ai_input.get("llm_input", {})
+            limits = (llm.get("limits") or {})
+            c1, c2, c3, c4 = st.columns(4, vertical_alignment="center")
+            c1.caption(f"Jobs: **{getattr(ui, 'total_jobs', '—')}**")
+            c2.caption(f"Scope: **{getattr(ui, 'scope', '—')}**")
+            c3.caption(f"Top N: **{limits.get('top_n_per_category', '—')}**")
+            c4.caption(f"Model: **{ai_model}**")
+
+        # ===== TRUNCATION HINTS =====
+        tr = ai_input.get("truncation") or {}
+        if tr.get("categories_truncated"):
+            st.caption("⚠️ Some categories are truncated by Top N per category.")
+
         with right:
             b1, b2, b3 = st.columns(3, vertical_alignment="center")
 
@@ -405,7 +432,7 @@ div.stButton > button {
                         st.session_state[inflight_key] = True
                         st.session_state[inflight_started_key] = time.time()
                         try:
-                            summary_text = _generate_ai_summary_text(ai_input)
+                            summary_text = _generate_ai_summary_text(llm_input)
                             _save(summary_text)
                             st.session_state[inflight_key] = False
                             st.session_state.pop(inflight_started_key, None)
