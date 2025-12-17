@@ -399,7 +399,8 @@ def _generate_ai_summary_text(ai_input: dict) -> str:
 
 
 def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate: bool = True) -> None:
-    st.subheader("🤖 AI Summary")
+    import time, hashlib
+    from datetime import datetime
 
     settings = load_settings()
     ai_model = settings.get("ai", {}).get("model", "gpt-5-mini")
@@ -413,6 +414,7 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
 
     cached = _load_cached_ai_summary(cache_path)
     input_hash = _hash_payload(cache_basis)
+
     cached_text = None
     cache_status = None
     if cached:
@@ -420,17 +422,21 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
             cached_text = cached.get("summary")
             cache_status = "current"
         elif cached.get("summary"):
-            # Fallback: use cached summary even if parameters changed, but mark as potentially outdated
             cached_text = cached.get("summary")
             cache_status = "outdated"
-    
+
     auto_key = f"ai_auto_{cache_path.name}_{input_hash[:8]}"
     inflight_key = f"ai_inflight_{cache_path.name}_{input_hash[:8]}"
     inflight_started_key = f"ai_inflight_started_{cache_path.name}_{input_hash[:8]}"
+
+    # Optional: remember whether the block is collapsed
+    collapsed_key = f"ai_collapsed_{cache_path.name}_{input_hash[:8]}"
+    if collapsed_key not in st.session_state:
+        st.session_state[collapsed_key] = False
+
     summary_text = cached_text
 
-    # If a previous run was interrupted (browser refresh, navigation, kernel reset),
-    # the UI can get stuck in an "inflight" state. Auto-clear after a grace period.
+    # Auto-clear stuck inflight
     try:
         inflight_started = st.session_state.get(inflight_started_key)
         if st.session_state.get(inflight_key) and isinstance(inflight_started, (int, float)):
@@ -440,24 +446,31 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
     except Exception:
         pass
 
+    def _save(summary: str) -> None:
+        _save_cached_ai_summary(
+            cache_path,
+            {
+                "model": ai_model,
+                "max_output_tokens": AI_SUMMARY_MAX_OUTPUT_TOKENS,
+                "system_prompt_hash": hashlib.sha256(AI_SUMMARY_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12],
+                "generated_at": datetime.now().isoformat(),
+                "input_hash": input_hash,
+                "summary": summary,
+            },
+        )
+
+    def _run_generation() -> str:
+        with st.spinner("Generating summary..."):
+            return _generate_ai_summary_text(ai_input)
+
+    # ===== AUTO GENERATE (keep your behavior) =====
     if auto_generate and (not cached_text) and (not st.session_state.get(auto_key)):
         st.session_state[auto_key] = True
         st.session_state[inflight_key] = True
         st.session_state[inflight_started_key] = time.time()
         try:
-            with st.spinner("Auto-generating AI summary..."):
-                summary_text = _generate_ai_summary_text(ai_input)
-            _save_cached_ai_summary(
-                cache_path,
-                {
-                    "model": ai_model,
-                    "max_output_tokens": AI_SUMMARY_MAX_OUTPUT_TOKENS,
-                    "system_prompt_hash": hashlib.sha256(AI_SUMMARY_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12],
-                    "generated_at": datetime.now().isoformat(),
-                    "input_hash": input_hash,
-                    "summary": summary_text,
-                },
-            )
+            summary_text = _run_generation()
+            _save(summary_text)
             st.session_state[inflight_key] = False
             st.session_state.pop(inflight_started_key, None)
             st.rerun()
@@ -468,87 +481,99 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
             st.error(str(exc))
             summary_text = None
 
-    if summary_text:
-        # Fixed-size, scrollable view (safe Markdown rendering)
-        # Avoid unsafe HTML injection: render markdown within a height-limited container.
-        cache_indicator = ""
-        if cache_status == "outdated":
-            cache_indicator = " ⚠️ *Summary may be outdated due to parameter changes*"
-        elif cache_status == "current":
-            cache_indicator = " ✅ *Using cached summary*"
-        
-        if cache_indicator:
-            st.caption(cache_indicator)
-        
-        try:
-            with st.container(height=260, border=True):
-                st.markdown(summary_text)
-        except TypeError:
-            # Fallback for older Streamlit versions without `height`/`border` params
-            st.markdown(summary_text)
+    # ===== UI CARD =====
+    with st.container(border=True):
+        # Header row (title + status on left, toolbar on right)
+        left, right = st.columns([0.72, 0.28], vertical_alignment="center")
 
-    # Top right button controls
-    _, col1, col2, col3 = st.columns([3, 1, 1, 1])  # Push buttons to the right
-    with col1:
-        label = "Regenerate" if summary_text else "Generate"
+        with left:
+            st.subheader("🤖 AI Summary")
+
+            if cache_status == "outdated":
+                st.caption("⚠️ Summary may be outdated (inputs/params changed)")
+            elif cache_status == "current":
+                st.caption("✅ Using cached summary")
+            elif summary_text:
+                st.caption("ℹ️ Summary available")
+            else:
+                st.caption("—")
+
+        with right:
+            b1, b2, b3 = st.columns(3)
+
+            # 1) Generate / Regenerate (or reset if stuck)
+            with b1:
+                if st.session_state.get(inflight_key):
+                    if st.button("🔄", use_container_width=True,
+                                 key=f"reset_{cache_path.name}_{input_hash[:8]}",
+                                 help="Reset stuck generation"):
+                        st.session_state[inflight_key] = False
+                        st.session_state.pop(inflight_started_key, None)
+                        st.session_state[auto_key] = False
+                        st.rerun()
+                else:
+                    label = "Generate" if not summary_text else "Regenerate"
+                    if st.button("✨", use_container_width=True,
+                                 key=f"gen_{cache_path.name}_{input_hash[:8]}",
+                                 help=f"{label} AI summary"):
+                        st.session_state[auto_key] = False
+                        st.session_state[inflight_key] = True
+                        st.session_state[inflight_started_key] = time.time()
+                        try:
+                            summary_text = _run_generation()
+                            _save(summary_text)
+                            st.session_state[inflight_key] = False
+                            st.session_state.pop(inflight_started_key, None)
+                            st.rerun()
+                            return
+                        except Exception as e:
+                            st.session_state[inflight_key] = False
+                            st.session_state.pop(inflight_started_key, None)
+                            st.error(str(e))
+                            summary_text = None
+
+            # 2) Clear cache
+            with b2:
+                disabled = not bool(cached_text)
+                if st.button("🗑️", use_container_width=True,
+                             key=f"clr_{cache_path.name}_{input_hash[:8]}",
+                             help="Clear cached summary",
+                             disabled=disabled):
+                    try:
+                        cache_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    st.rerun()
+
+            # 3) Expand (dialog) OR collapse toggle
+            with b3:
+                disabled = not bool(summary_text)
+                if st.button("⤢", use_container_width=True,
+                             key=f"exp_{cache_path.name}_{input_hash[:8]}",
+                             help="Expand AI summary",
+                             disabled=disabled):
+                    if hasattr(st, "dialog"):
+                        @st.dialog("🤖 AI Summary")
+                        def _show_ai_summary_dialog(text: str):
+                            st.markdown(text)
+                        _show_ai_summary_dialog(summary_text or "")
+                    else:
+                        st.session_state[collapsed_key] = False  # ensure visible
+                        with st.expander("AI Summary (expanded)", expanded=True):
+                            st.markdown(summary_text or "")
+
+        # Body
         if st.session_state.get(inflight_key):
             st.info("Generating summary…")
-            if st.button(
-                "🔄",
-                use_container_width=True,
-                key=f"reset_{cache_path.name}_{input_hash[:8]}",
-                help="Reset stuck generation",
-            ):
-                st.session_state[inflight_key] = False
-                st.session_state.pop(inflight_started_key, None)
-                st.session_state[auto_key] = False
-                st.rerun()
-        else:
-            if st.button("🔄", use_container_width=True, key=f"gen_{cache_path.name}_{input_hash[:8]}", help=f"{label} AI summary"):
-                st.session_state[auto_key] = False
-                st.session_state[inflight_key] = True
-                st.session_state[inflight_started_key] = time.time()
-                try:
-                    with st.spinner("Generating summary..."):
-                        summary_text = _generate_ai_summary_text(ai_input)
-                    _save_cached_ai_summary(
-                        cache_path,
-                        {
-                            "model": ai_model,
-                            "max_output_tokens": AI_SUMMARY_MAX_OUTPUT_TOKENS,
-                            "system_prompt_hash": hashlib.sha256(AI_SUMMARY_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12],
-                            "generated_at": datetime.now().isoformat(),
-                            "input_hash": input_hash,
-                            "summary": summary_text,
-                        },
-                    )
-                    st.session_state[inflight_key] = False
-                    st.session_state.pop(inflight_started_key, None)
-                    st.rerun()
-                    return
-                except Exception as e:
-                    st.session_state[inflight_key] = False
-                    st.session_state.pop(inflight_started_key, None)
-                    st.error(str(e))
-    with col2:
-        if cached_text and st.button("🗑️", use_container_width=True, key=f"clr_{cache_path.name}_{input_hash[:8]}", help="Clear cached summary"):
-            try:
-                cache_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            st.rerun()
-    with col3:
-        if summary_text and st.button("⤢", use_container_width=True, key=f"exp_{cache_path.name}_{input_hash[:8]}", help="Expand AI summary"):
-            if hasattr(st, "dialog"):
-                @st.dialog("🤖 AI Summary")
-                def _show_ai_summary_dialog(text: str):
-                    st.markdown(text)
 
-                _show_ai_summary_dialog(summary_text)
-            else:
-                # Fallback for older Streamlit: show a large expander.
-                with st.expander("AI Summary (expanded)", expanded=True):
+        if summary_text:
+            try:
+                with st.container(height=260, border=True):
                     st.markdown(summary_text)
+            except TypeError:
+                st.markdown(summary_text)
+        else:
+            st.markdown("_No summary yet._")
 
 # ============================================================================
 # Settings Persistence
