@@ -481,6 +481,16 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
             st.error(str(exc))
             summary_text = None
 
+    st.markdown("""
+<style>
+div.stButton > button {
+  height: 2.3rem;
+  border-radius: 10px;
+  padding: 0.1rem 0.4rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
     # ===== UI CARD =====
     with st.container(border=True):
         # Header row (title + status on left, toolbar on right)
