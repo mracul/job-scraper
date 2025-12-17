@@ -1,6 +1,6 @@
 """Tests for job deduplication logic."""
 import pytest
-from deduplication import Deduplicator
+from pipeline.deduplicator import Deduplicator
 from models import Job
 
 @pytest.fixture

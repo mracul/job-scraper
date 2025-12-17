@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from analyze_requirements import JobRequirementsAnalyzer
+from pipeline.requirements_analyzer import JobRequirementsAnalyzer
 
 
 def test_analyze_job_counts_non_cert_categories():

@@ -1,4 +1,4 @@
-from analyze_requirements import JobRequirementsAnalyzer
+from pipeline.requirements_analyzer import JobRequirementsAnalyzer
 
 
 def test_msp_tag_detected_from_abbreviation_or_phrase():

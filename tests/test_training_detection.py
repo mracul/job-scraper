@@ -1,4 +1,4 @@
-from analyze_requirements import JobRequirementsAnalyzer
+from pipeline.requirements_analyzer import JobRequirementsAnalyzer
 
 
 def test_training_provided_detection_in_benefits():

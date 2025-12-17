@@ -26,6 +26,10 @@ import plotly.express as px
 # Import the AI summary UI block from the new module
 from ai_summary_ui import render_ai_summary_block
 
+# Import views
+from ui.views.reports import render_reports_page
+from ui.views.jobs import render_job_explorer, render_job_detail_view
+
 from ui_core import build_ai_summary_input as _ui_build_ai_summary_input
 from ui_core import merge_analyses as _ui_merge_analyses
 
@@ -42,7 +46,7 @@ from ui.io_cache import (
     _get_run_search_meta,
 )
 
-from compiled_report_store import (
+from storage.compiled_report_store import (
     build_compiled_report_payload,
     build_runs_fingerprint,
     compiled_report_path,
@@ -753,9 +757,13 @@ def _encode_state_for_url(state: dict, extra: dict | None = None) -> dict:
     return params
 
 
-def _apply_state_from_url() -> None:
-    """Apply navigation state from current URL query params (enables browser back/forward)."""
+def _apply_state_from_url() -> bool:
+    """Apply navigation state from current URL query params (enables browser back/forward).
+    
+    Returns True if any session state was changed, False otherwise.
+    """
     params = _get_query_params()
+    state_changed = False
 
     def _param_value(key: str) -> str | None:
         value = params.get(key)
@@ -775,31 +783,45 @@ def _apply_state_from_url() -> None:
     filters_raw = _param_value("filters")
     compiled_raw = _param_value("compiled")
 
-    if page:
+    if page and st.session_state.get("page") != page:
         st.session_state.page = page
-    if view:
+        state_changed = True
+    if view and st.session_state.get("view_mode") != view:
         st.session_state.view_mode = view
-    if run is not None:
+        state_changed = True
+    if run is not None and st.session_state.get("selected_run") != run:
         st.session_state.selected_run = run
+        state_changed = True
 
     if job is not None:
         try:
-            st.session_state.viewing_job_id = int(job)
+            job_id = int(job)
+            if st.session_state.get("viewing_job_id") != job_id:
+                st.session_state.viewing_job_id = job_id
+                state_changed = True
         except Exception:
-            st.session_state.viewing_job_id = None
-    else:
+            if st.session_state.get("viewing_job_id") is not None:
+                st.session_state.viewing_job_id = None
+                state_changed = True
+    elif st.session_state.get("viewing_job_id") is not None:
         st.session_state.viewing_job_id = None
+        state_changed = True
 
-    if match in {"any", "all"}:
+    if match in {"any", "all"} and st.session_state.get("filter_mode") != match:
         st.session_state.filter_mode = match
-    if q is not None:
+        state_changed = True
+    if q is not None and st.session_state.get("search_text") != q:
         st.session_state.search_text = q
+        state_changed = True
 
     if filters_raw:
         try:
             parsed = json.loads(filters_raw)
             if isinstance(parsed, dict):
-                st.session_state.selected_filters = {k: list(v) for k, v in parsed.items() if isinstance(v, list)}
+                new_filters = {k: list(v) for k, v in parsed.items() if isinstance(v, list)}
+                if st.session_state.get("selected_filters") != new_filters:
+                    st.session_state.selected_filters = new_filters
+                    state_changed = True
         except Exception:
             pass
 
@@ -807,11 +829,17 @@ def _apply_state_from_url() -> None:
         try:
             parsed = json.loads(compiled_raw)
             if isinstance(parsed, list):
-                st.session_state.compiled_runs = [str(p) for p in parsed]
+                new_compiled = [str(p) for p in parsed]
+                if st.session_state.get("compiled_runs") != new_compiled:
+                    st.session_state.compiled_runs = new_compiled
+                    state_changed = True
         except Exception:
             pass
-    else:
+    elif st.session_state.get("compiled_runs"):
         st.session_state.compiled_runs = []
+        state_changed = True
+
+    return state_changed
 
 
 def _sync_url_with_state(force: bool = False, extra_params: dict | None = None) -> None:
@@ -944,7 +972,6 @@ def render_sidebar():
             st.warning("🔄 Scrape running...")
             if st.button("View Progress", use_container_width=True, type="primary"):
                 navigate_to("new_run")
-                st.rerun()
             st.markdown("---")
         else:
             # Quick stats
@@ -978,7 +1005,6 @@ def render_sidebar():
                     )
                 else:
                     navigate_to(key)
-                st.rerun()
         
         st.markdown("---")
 
@@ -1065,31 +1091,13 @@ def render_breadcrumb():
         clicked_idx = labels.index(selected)
         nav_kwargs = crumbs[clicked_idx][1]
         navigate_to("reports", **nav_kwargs)
-        st.rerun()
 
 
 # ============================================================================
 # Page: Reports
 # ============================================================================
 
-def render_reports_page():
-    """Render the reports page."""
-    _normalize_navigation_state()
-    render_breadcrumb()
-
-    if st.session_state.view_mode == "compiled_overview":
-        render_compiled_overview()
-        return
-
-    if st.session_state.selected_run:
-        if st.session_state.view_mode == "job_detail":
-            render_job_detail_view()
-        elif st.session_state.view_mode == "explorer":
-            render_job_explorer()
-        else:
-            render_report_overview()
-    else:
-        render_report_list()
+# render_reports_page() is now imported from ui.views.reports
 
 
 # ============================================================================
@@ -1371,7 +1379,6 @@ def render_report_list():
         st.info("No reports found. Start a new scraping run to generate reports.")
         if st.button("🚀 Start New Run"):
             navigate_to("new_run")
-            st.rerun()
         return
 
     selected_paths: list[str] = []
@@ -2218,311 +2225,6 @@ def render_report_overview():
                                 st.rerun()
 
 
-def render_job_explorer():
-    """Render the job explorer with tag filtering."""
-    run_path = Path(st.session_state.selected_run)
-    analysis = load_analysis(run_path)
-    jobs_df = load_jobs_csv(run_path)
-    
-    st.header("🔍 Job Explorer")
-    
-    if not analysis or jobs_df is None:
-        st.warning("Missing data for job exploration.")
-        return
-
-    # Calculate posting dates for sorting
-    posting_dates = {}
-    for idx in range(len(jobs_df)):
-        job_row = jobs_df.iloc[idx]
-        date_value = job_row.get("date_posted")
-        if pd.notna(date_value) and date_value:
-            try:
-                # Extract scraping date from folder name (format: ..._YYYYMMDD_HHMMSS)
-                folder_name = run_path.name
-                date_match = re.search(r'_(\d{8})_', folder_name)
-                if date_match:
-                    scrape_date_str = date_match.group(1)
-                    scrape_date = datetime.strptime(scrape_date_str, "%Y%m%d")
-                    
-                    # Parse date_posted (e.g., "2d ago", "1w ago")
-                    days_ago = 0
-                    if "d ago" in date_value:
-                        days_ago = int(re.search(r'(\d+)d ago', date_value).group(1))
-                    elif "w ago" in date_value:
-                        days_ago = int(re.search(r'(\d+)w ago', date_value).group(1)) * 7
-                    elif "h ago" in date_value:
-                        hours_ago = int(re.search(r'(\d+)h ago', date_value).group(1))
-                        days_ago = hours_ago // 24
-                    
-                    posting_date = scrape_date - pd.Timedelta(days=days_ago)
-                    posting_dates[idx + 1] = posting_date  # job_id is 1-indexed
-            except (ValueError, AttributeError):
-                pass
-    
-    # Sort jobs by most recent date (newest first)
-    reverse_sort = True
-    
-    def _job_sort_key(job_id: int):
-        dt = posting_dates.get(job_id)
-        if dt is None:
-            return datetime.min if reverse_sort else datetime.max  # Unknown dates at end
-        return dt
-    
-    # Get job data from analysis (for requirements)
-    job_details = {j["id"]: j for j in analysis.get("job_details", [])}
-    
-    # Apply filters to get matching jobs
-    all_selected_terms = []
-    for cat, terms in st.session_state.selected_filters.items():
-        for term in terms:
-            all_selected_terms.append((cat, term))
-    
-    # Build job matching results
-    job_matches = {}  # job_id -> set of matched (cat, term) tuples
-    
-    for job_id, job_data in job_details.items():
-        reqs = job_data.get("requirements", {})
-        presence_reqs = reqs.get("presence", {}) if isinstance(reqs, dict) else reqs
-        matched = set()
-        
-        for cat, term in all_selected_terms:
-            if term in presence_reqs.get(cat, []):
-                matched.add((cat, term))
-        
-        if matched or not all_selected_terms:
-            job_matches[job_id] = matched
-    
-    # Filter by search text
-    if st.session_state.search_text:
-        search_lower = st.session_state.search_text.lower()
-        filtered_ids = set()
-        for job_id in job_matches:
-            job_data = job_details.get(job_id, {})
-            title = (job_data.get("title") or "").lower()
-            company = (job_data.get("company") or "").lower()
-            if search_lower in title or search_lower in company:
-                filtered_ids.add(job_id)
-        job_matches = {k: v for k, v in job_matches.items() if k in filtered_ids}
-    
-    # Apply match mode filter
-    if all_selected_terms:
-        if st.session_state.filter_mode == "all":
-            # Must match ALL selected tags
-            required = set(all_selected_terms)
-            job_matches = {k: v for k, v in job_matches.items() if v == required}
-        else:
-            # Must match ANY (at least one)
-            job_matches = {k: v for k, v in job_matches.items() if v}
-    
-    # Group jobs by their matched tag combination
-    groups = defaultdict(list)
-    for job_id, matched_tags in job_matches.items():
-        # Create a hashable key for the tag combination
-        tag_key = tuple(sorted(matched_tags)) if matched_tags else (("_none", "All Jobs"),)
-        groups[tag_key].append(job_id)
-    
-    # Sort groups by size descending
-    sorted_groups = sorted(groups.items(), key=lambda x: len(x[1]), reverse=True)
-    
-    # Display active filters summary
-    active_filters = []
-    for cat, terms in st.session_state.selected_filters.items():
-        for term in terms:
-            active_filters.append((cat, term))
-    if active_filters or st.session_state.search_text:
-        col1, col2 = st.columns([3,1])
-        with col1:
-            filter_text = []
-            if st.session_state.search_text:
-                filter_text.append(f"🔎 {st.session_state.search_text}")
-            for cat, term in active_filters:
-                cat_label = CATEGORY_LABELS.get(cat, cat)
-                filter_text.append(f"{cat_label}: {term}")
-            if filter_text:
-                st.caption("Active filters: " + " | ".join(filter_text))
-        with col2:
-            if st.button("Clear All", key="clear_filters_main"):
-                navigate_to(
-                    "reports",
-                    selected_run=st.session_state.selected_run,
-                    view_mode="explorer",
-                    viewing_job_id=None,
-                    selected_filters={},
-                    filter_mode="any",
-                    search_text="",
-                )
-                st.rerun()
-    
-    # Display results
-    st.subheader(f"Results: {len(job_matches)} jobs")
-    
-    if not job_matches:
-        st.info("No jobs match the current filters.")
-        return
-    
-    for tag_key, job_ids in sorted_groups:
-        # Build group header
-        if tag_key == (("_none", "All Jobs"),):
-            header = "All Jobs"
-        else:
-            tag_labels = [f"{t[1]}" for t in tag_key]
-            header = ", ".join(tag_labels)
-        
-        with st.expander(f"**{header}** ({len(job_ids)} jobs)", expanded=True):
-            for job_id in sorted(job_ids, key=_job_sort_key, reverse=reverse_sort):
-                job_data = job_details.get(job_id, {})
-                title = job_data.get("title", f"Job {job_id}")
-                company = job_data.get("company", "Unknown")
-
-                job_row = jobs_df.iloc[job_id - 1] if 0 <= job_id - 1 < len(jobs_df) else None
-                date_text = None
-                days_ago_text = ""
-                if job_row is not None:
-                    date_value = job_row.get("date_posted")
-                    if pd.notna(date_value) and date_value:
-                        date_text = str(date_value)
-                        # Calculate days ago
-                        try:
-                            # Extract scraping date from folder name (format: ..._YYYYMMDD_HHMMSS)
-                            folder_name = run_path.name
-                            date_match = re.search(r'_(\d{8})_', folder_name)
-                            if date_match:
-                                scrape_date_str = date_match.group(1)
-                                scrape_date = datetime.strptime(scrape_date_str, "%Y%m%d")
-                                
-                                # Parse date_posted (e.g., "2d ago", "1w ago")
-                                days_ago = 0
-                                if "d ago" in date_value:
-                                    days_ago = int(re.search(r'(\d+)d ago', date_value).group(1))
-                                elif "w ago" in date_value:
-                                    days_ago = int(re.search(r'(\d+)w ago', date_value).group(1)) * 7
-                                elif "h ago" in date_value:
-                                    hours_ago = int(re.search(r'(\d+)h ago', date_value).group(1))
-                                    days_ago = hours_ago // 24
-                                
-                                posting_date = scrape_date - pd.Timedelta(days=days_ago)
-                                actual_days_ago = (datetime.now() - posting_date).days
-                                if actual_days_ago == 0:
-                                    days_ago_text = " (today)"
-                                elif actual_days_ago == 1:
-                                    days_ago_text = " (1 day ago)"
-                                else:
-                                    days_ago_text = f" ({actual_days_ago} days ago)"
-                        except (ValueError, AttributeError):
-                            pass  # Keep days_ago_text empty if parsing fails
-
-                col1, col2, col3 = st.columns([0.25, 3, 1])
-
-                with col1:
-                    if days_ago_text:
-                        st.caption(f"🕒{days_ago_text.strip(' ()')}")
-                    elif date_text:
-                        st.caption(f"📅 {date_text}")
-
-                with col2:
-                    if st.button(f"{title} — {company}", key=f"job_title_{job_id}"):
-                        navigate_to(
-                            "reports",
-                            selected_run=st.session_state.selected_run,
-                            view_mode="job_detail",
-                            viewing_job_id=job_id,
-                        )
-                        st.rerun()
-
-                with col3:
-                    if st.button("View", key=f"view_job_{job_id}", use_container_width=True):
-                        navigate_to(
-                            "reports",
-                            selected_run=st.session_state.selected_run,
-                            view_mode="job_detail",
-                            viewing_job_id=job_id,
-                        )
-                        st.rerun()
-
-
-def render_job_detail_view():
-    """Render detailed view of a single job."""
-    run_path = Path(st.session_state.selected_run)
-    analysis = load_analysis(run_path)
-    jobs_df = load_jobs_csv(run_path)
-    
-    job_id = st.session_state.viewing_job_id
-    
-    if not analysis or jobs_df is None or job_id is None:
-        st.warning("Job data not available.")
-        return
-    
-    # Get job data from analysis (for requirements)
-    job_details = {j["id"]: j for j in analysis.get("job_details", [])}
-    job_meta = job_details.get(job_id, {})
-    
-    # Get full job data from CSV (for description, url, etc.)
-    # CSV is 0-indexed, job_id is 1-indexed
-    csv_idx = job_id - 1
-    if csv_idx < 0 or csv_idx >= len(jobs_df):
-        st.warning("Job not found in data.")
-        return
-    
-    job_row = jobs_df.iloc[csv_idx]
-    
-    # Header card
-    st.header(job_row.get("title", "Unknown Job"))
-    st.subheader(f"🏢 {job_row.get('company', 'Unknown Company')}")
-    
-    # Metadata row
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.markdown(f"📍 **Location:** {job_row.get('location', 'Not specified')}")
-    with col2:
-        salary = job_row.get("salary")
-        if pd.notna(salary) and salary:
-            st.markdown(f"💰 **Salary:** {salary}")
-        else:
-            st.markdown("💰 **Salary:** Not specified")
-    with col3:
-        date_posted = job_row.get("date_posted")
-        if pd.notna(date_posted) and date_posted:
-            st.markdown(f"📅 **Posted:** {date_posted}")
-        else:
-            st.markdown("📅 **Posted:** Not specified")
-    with col4:
-        st.markdown(f"🌐 **Source:** {job_row.get('source', 'Unknown')}")
-    
-    # Link to original
-    url = job_row.get("url")
-    if pd.notna(url) and url:
-        st.markdown(f"### [🔗 Open Original Listing →]({url})")
-    
-    st.markdown("---")
-    
-    # Matched requirements as badges
-    reqs = job_meta.get("requirements", {})
-    if any(reqs.values()):
-        st.subheader("🏷️ Matched Requirements")
-        
-        for cat_key, cat_label in CATEGORY_LABELS.items():
-            terms = reqs.get(cat_key, [])
-            if terms:
-                st.markdown(f"**{cat_label}:**")
-                badge_html = " ".join([f'`{term}`' for term in terms])
-                st.markdown(badge_html)
-        
-        st.markdown("---")
-    
-    # Full description
-    st.subheader("📄 Full Description")
-    
-    full_desc = job_row.get("full_description")
-    short_desc = job_row.get("description")
-    
-    description = full_desc if pd.notna(full_desc) and full_desc else short_desc
-    
-    if pd.notna(description) and description:
-        st.markdown(description)
-    else:
-        st.info("No description available.")
-
-
 # ============================================================================
 # Page: New Run
 # ============================================================================
@@ -2979,7 +2681,6 @@ def render_run_progress():
         with col2:
             if st.button("📂 View Reports", use_container_width=True):
                 navigate_to("reports")
-                st.rerun()
         with col3:
             if st.button("🚀 Start Another Run", use_container_width=True):
                 st.rerun()
@@ -3159,10 +2860,11 @@ def main():
     params_str = json.dumps(params, sort_keys=True)
 
     if st.session_state.get("last_url_state") != params_str:
-        _apply_state_from_url()
+        state_changed = _apply_state_from_url()
         st.session_state.last_url_state = params_str
-        _normalize_navigation_state()
-        st.rerun()
+        if state_changed:
+            _normalize_navigation_state()
+            st.rerun()
 
     render_sidebar()
     
@@ -3179,7 +2881,7 @@ def main():
         render_reports_page()
 
     # Optional passive sync (only if you need it)
-    _sync_url_with_state(force=False)
+    # _sync_url_with_state(force=False)
 
 
 if __name__ == "__main__":

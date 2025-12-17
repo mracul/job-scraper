@@ -9,9 +9,9 @@ import argparse
 from datetime import datetime
 from seek_scraper import SeekScraper
 from models import JobCollection
-from job_storage import JobStorage
-from deduplication import Deduplicator
-from url_skip_store import load_seen_urls, add_urls
+from storage.job_store import JobStorage
+from pipeline.deduplicator import Deduplicator
+from storage.url_skip_store import load_seen_urls, add_urls
 from pathlib import Path
 import os
 
@@ -144,7 +144,7 @@ def read_run_metadata(run_path: Path) -> dict:
 
 def analyze_ui():
     """Interactive UI to select one or more runs and analyze requirements."""
-    from analyze_requirements import JobRequirementsAnalyzer
+    from pipeline.requirements_analyzer import JobRequirementsAnalyzer
     from browse_report import browse_requirements_index
     runs = list_runs_for_analysis()
     if not runs:
@@ -701,7 +701,7 @@ Examples:
         print("=" * 60)
         
         try:
-            from analyze_requirements import JobRequirementsAnalyzer
+            from pipeline.requirements_analyzer import JobRequirementsAnalyzer
 
             jsonl_file = os.path.join(run_folder, "jobs.jsonl")
             md_file = os.path.join(run_folder, "compiled_jobs.md")
