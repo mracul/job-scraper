@@ -34,6 +34,21 @@ from compiled_report_store import (
 )
 
 
+def split_tldr(md: str):
+    """
+    Extract the TL;DR section (## TL;DR ...) and return (tldr_md, rest_md).
+    Safe no-op if TL;DR not present.
+    """
+    if not md:
+        return "", ""
+
+    m = re.search(r"(?ms)^##\s+TL;DR.*?(?=^##\s+|\Z)", md)
+    if not m:
+        return "", md
+
+    tldr = m.group(0).strip()
+    rest = (md[:m.start()] + md[m.end():]).strip()
+    return tldr, rest
 
 
 # ============================================================================
@@ -497,16 +512,18 @@ div.stButton > button {
         left, right = st.columns([0.72, 0.28], vertical_alignment="center")
 
         with left:
-            st.subheader("🤖 AI Summary")
-
-            if cache_status == "outdated":
-                st.caption("⚠️ Summary may be outdated (inputs/params changed)")
-            elif cache_status == "current":
-                st.caption("✅ Using cached summary")
+            status = "• —"
+            if cache_status == "current":
+                status = "• ✅ cached"
+            elif cache_status == "outdated":
+                status = "• ⚠️ outdated"
             elif summary_text:
-                st.caption("ℹ️ Summary available")
-            else:
-                st.caption("—")
+                status = "• ℹ️ generated"
+
+            st.markdown(
+                f"### 🤖 AI Summary <span style='opacity:0.65;font-size:0.9em;'>{status}</span>",
+                unsafe_allow_html=True,
+            )
 
         with right:
             b1, b2, b3 = st.columns(3)
@@ -577,11 +594,19 @@ div.stButton > button {
             st.info("Generating summary…")
 
         if summary_text:
+            tldr_md, rest_md = split_tldr(summary_text)
+
+            # TL;DR always visible (no scroll)
+            if tldr_md:
+                st.markdown(tldr_md)
+                st.markdown("---")  # subtle divider inside the card
+
+            # Details scroll (NO border to avoid nesting)
             try:
-                with st.container(height=260, border=True):
-                    st.markdown(summary_text)
+                with st.container(height=260):
+                    st.markdown(rest_md or "_No further details._")
             except TypeError:
-                st.markdown(summary_text)
+                st.markdown(rest_md or "_No further details._")
         else:
             st.markdown("_No summary yet._")
 
