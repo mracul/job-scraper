@@ -9,6 +9,7 @@ import pandas as pd
 import requests
 import json
 import re
+from markdown import markdown as md_to_html
 import os
 import time
 import subprocess
@@ -49,6 +50,18 @@ def split_tldr(md: str):
     tldr = m.group(0).strip()
     rest = (md[:m.start()] + md[m.end():]).strip()
     return tldr, rest
+
+
+def render_markdown_scroll(md: str, *, height_px: int = 260):
+    """
+    Bulletproof scroll viewer: converts Markdown -> HTML and renders inside our own div.
+    This avoids Streamlit's markdown container styling that creates the 'inner box'.
+    """
+    html = md_to_html(md or "_No further details._", extensions=["extra", "tables", "sane_lists"])
+    st.markdown(
+        f"<div class='ai-scroll' style='max-height:{height_px}px'>{html}</div>",
+        unsafe_allow_html=True,
+    )
 
 
 # ============================================================================
@@ -634,6 +647,12 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
     border-radius: 0 !important;
     box-shadow: none !important;
     }
+
+    /* scrollable markdown viewer */
+    .ai-scroll {
+    overflow-y: auto;
+    padding: 0.5rem;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -733,11 +752,7 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
                 st.markdown("---")  # subtle divider inside the card
 
             # Details scroll (NO border to avoid nesting)
-            try:
-                with st.container(height=260):
-                    st.markdown(rest_md or "_No further details._")
-            except TypeError:
-                st.markdown(rest_md or "_No further details._")
+            render_markdown_scroll(rest_md, height_px=260)
         else:
             st.markdown("_No summary yet._")
 
