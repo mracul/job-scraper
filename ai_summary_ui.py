@@ -393,8 +393,8 @@ div.stButton > button {
             c4.caption(f"Model: **{ai_model}**")
 
         # ===== TRUNCATION HINTS =====
-        tr = ai_input.get("truncation") or {}
-        if tr.get("categories_truncated"):
+        tr = ai_input.get("truncation")
+        if tr and getattr(tr, "categories_truncated", False):
             st.caption("⚠️ Some categories are truncated by Top N per category.")
 
         with right:

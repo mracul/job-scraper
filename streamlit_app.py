@@ -1346,7 +1346,6 @@ def render_overview_page():
         }
 
         from ai.ai_payloads import build_ai_bundle
-        from ui.constants import CATEGORY_LABELS
         bundle = build_ai_bundle(
             scope=f"overview_{cutoff_days}d_hl{half_life_days}d",
             overview=overview_data,
@@ -1693,7 +1692,6 @@ def render_compiled_overview():
     )
 
     from ai.ai_payloads import build_ai_bundle
-    from ui.constants import CATEGORY_LABELS
     bundle = build_ai_bundle(
         scope="compiled",
         analysis_text=combined_txt,
@@ -2007,7 +2005,6 @@ def render_report_overview():
     keywords, location = _get_run_search_meta(run_path)
     txt = load_requirements_analysis_txt(run_path)
     from ai.ai_payloads import build_ai_bundle
-    from ui.constants import CATEGORY_LABELS, AI_SUMMARY_TOP_N_SINGLE
 
     if txt and txt.strip():
         bundle = build_ai_bundle(
