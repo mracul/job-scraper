@@ -252,17 +252,17 @@ Add orchestrator:
 - [x] Create `ui/views/reports.py`
 - [x] Move (verbatim first):
   - [x] reports list rendering
-  - [ ] single report overview rendering
-  - [ ] compiled overview rendering
+  - [x] single report overview rendering
+  - [x] compiled overview rendering
 - [x] Replace in `streamlit_app.py` with:
   - [x] `from ui.views.reports import render_reports_page`
   - [x] route to `render_reports_page()`
 
 Use components:
-- [ ] `render_page_header`
-- [ ] `run_list_table`
-- [ ] `bulk_action_bar`
-- [ ] AI summary block
+- [x] `render_page_header`
+- [x] `run_list_table`
+- [x] `bulk_action_bar`
+- [x] AI summary block
 
 ✅ Acceptance: reports list + overview + compiled overview work.
 
@@ -270,13 +270,13 @@ Use components:
 
 ## 6.2 Jobs view
 
-- [ ] Create `ui/views/jobs.py`
-- [ ] Move:
-  - [ ] Job Explorer list
-  - [ ] Job detail view
-- [ ] Use:
-  - [ ] `job_filter_toolbar`
-  - [ ] `job_result_row`
+- [x] Create `ui/views/jobs.py`
+- [x] Move:
+  - [x] Job Explorer list
+  - [x] Job detail view
+- [x] Use:
+  - [x] `job_filter_toolbar`
+  - [x] `job_result_row`
 
 ✅ Acceptance: explorer filters + job detail work; URL back/forward still works.
 
@@ -284,9 +284,9 @@ Use components:
 
 ## 6.3 Overview view
 
-- [ ] Create `ui/views/overview.py`
-- [ ] Move overview page render
-- [ ] Call `pipeline/overview_builder.py`
+- [x] Create `ui/views/overview.py`
+- [x] Move overview page render
+- [x] Call `pipeline/overview_builder.py`
 - [ ] Add sticky action bar (primary only) due to long page
 
 ✅ Acceptance: overview generate/export unchanged; sticky CTA visible.

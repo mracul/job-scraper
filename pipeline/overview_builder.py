@@ -7,6 +7,9 @@ from typing import Dict, Any, List, Optional
 from pathlib import Path
 import json
 from datetime import datetime, timedelta
+from collections import defaultdict
+import pandas as pd
+from ui.constants import CATEGORY_LABELS
 
 
 class OverviewBuilder:
@@ -20,18 +23,18 @@ class OverviewBuilder:
     def __init__(self):
         pass
 
-    def build_overview(
+    def build_overview_from_runs(
         self,
-        run_data: Dict[str, Any],
-        cutoff_days: int = 30,
-        half_life_days: int = 14,
+        runs: List[Dict[str, Any]],
+        cutoff_days: int = 180,
+        half_life_days: int = 30,
         top_n: int = 10
     ) -> Dict[str, Any]:
         """
-        Build overview payload from run data.
+        Build overview payload from multiple runs with weighted merging.
 
         Args:
-            run_data: Dictionary containing run information and jobs
+            runs: List of run dictionaries
             cutoff_days: Age cutoff for recent jobs
             half_life_days: Half-life for recency weighting
             top_n: Number of top items to show
@@ -39,45 +42,143 @@ class OverviewBuilder:
         Returns:
             Overview payload dictionary
         """
-
-        jobs = run_data.get('jobs', [])
-        run_info = run_data.get('run_info', {})
-
-        # Calculate time-based filtering
-        cutoff_date = datetime.now() - timedelta(days=cutoff_days)
-
-        # Filter recent jobs
-        recent_jobs = self._filter_recent_jobs(jobs, cutoff_date)
-
-        # Build category rankings with recency weighting
-        category_data = self._build_category_rankings(
-            recent_jobs,
-            half_life_days,
-            top_n
+        return self._build_overview_payload(
+            runs=runs,
+            cutoff_days=cutoff_days,
+            half_life_days=half_life_days,
+            top_n=top_n
         )
 
-        # Build market context
-        market_context = self._build_market_context(recent_jobs, top_n)
+    def _build_overview_payload(self, *, runs: list[dict], cutoff_days: int, half_life_days: int, top_n: int) -> dict:
+        """Build overview payload with weighted merge using half-life decay model.
+        
+        Weight formula: w_i = 2^(-delta_i / H)
+        where delta_i = age in days from t_ref, H = half_life_days
+        """
+        from storage.job_store import load_analysis  # Import here to avoid circular imports
+        
+        usable_runs: list[dict] = []
+        analyses: list[dict] = []
+        run_timestamps: list[float] = []
 
-        # Build overview payload
-        overview = {
-            'run_info': run_info,
-            'summary_stats': {
-                'total_jobs': len(jobs),
-                'recent_jobs': len(recent_jobs),
-                'cutoff_days': cutoff_days,
-                'half_life_days': half_life_days,
-                'top_n': top_n,
-                'generated_at': datetime.now().isoformat()
+        for r in runs:
+            run_path = Path(r.get("path"))
+            analysis = load_analysis(run_path)
+            if not analysis:
+                continue
+            total_jobs = int(analysis.get("total_jobs", 0) or 0)
+            summary = analysis.get("summary", {}) or analysis.get("presence", {}) or {}
+            if not isinstance(summary, dict) or (not summary):
+                continue
+            run_ts = r.get("timestamp")
+            if not isinstance(run_ts, datetime):
+                continue
+            run_timestamps.append(run_ts.timestamp())
+            usable_runs.append(
+                {
+                    "name": str(r.get("name") or run_path.name),
+                    "path": str(run_path),
+                    "timestamp": run_ts.isoformat(),
+                    "job_count": int(r.get("job_count", total_jobs) or total_jobs),
+                    "total_jobs": total_jobs,
+                }
+            )
+            analyses.append({"total_jobs": total_jobs, "summary": summary, "timestamp": run_ts})
+
+        if not usable_runs:
+            return {
+                "generated_at": datetime.now().isoformat(),
+                "runs": [],
+                "meta": {
+                    "cutoff_days": cutoff_days,
+                    "half_life_days": half_life_days,
+                    "raw_jobs": 0,
+                    "effective_jobs": 0.0,
+                    "min_ts": None,
+                    "max_ts": None,
+                },
+                "weighted_summary": {},
+                "top_terms": {},
+                "series": [],
+            }
+
+        # t_ref = max timestamp among usable runs
+        t_ref = max(run_timestamps)
+        t_ref_dt = datetime.fromtimestamp(t_ref)
+        min_ts = min(run_timestamps)
+        min_ts_dt = datetime.fromtimestamp(min_ts)
+
+        # Compute weights and weighted merge
+        raw_jobs = 0
+        effective_jobs = 0.0
+        weighted_counts: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+
+        for analysis in analyses:
+            run_ts = analysis["timestamp"]
+            total_jobs = analysis["total_jobs"]
+            summary = analysis["summary"]
+            weight = self._compute_run_weight(run_ts, t_ref, half_life_days)
+
+            raw_jobs += total_jobs
+            effective_jobs += weight * total_jobs
+
+            for cat_key in CATEGORY_LABELS.keys():
+                cat_map = summary.get(cat_key, {}) or {}
+                if not isinstance(cat_map, dict):
+                    continue
+                for term, count in cat_map.items():
+                    if isinstance(count, (int, float)):
+                        weighted_counts[cat_key][term] += weight * count
+
+        # Build top_terms and weighted_summary
+        top_terms = {}
+        weighted_summary = {}
+
+        for cat_key, term_weights in weighted_counts.items():
+            # Sort by weighted count descending
+            sorted_terms = sorted(term_weights.items(), key=lambda x: x[1], reverse=True)
+            top_terms[cat_key] = [
+                {"term": term, "weighted_count": count, "rank": i+1}
+                for i, (term, count) in enumerate(sorted_terms[:top_n])
+            ]
+            
+            # Build weighted_summary (term -> {weighted_count, ...})
+            weighted_summary[cat_key] = {
+                term: {"weighted_count": count}
+                for term, count in sorted_terms
+            }
+
+        # Build series data for visualization
+        series = []
+        for cat_key, terms in top_terms.items():
+            for term_data in terms:
+                series.append({
+                    "category": cat_key,
+                    "term": term_data["term"],
+                    "weighted_count": term_data["weighted_count"],
+                    "rank": term_data["rank"]
+                })
+
+        return {
+            "generated_at": datetime.now().isoformat(),
+            "runs": usable_runs,
+            "meta": {
+                "cutoff_days": cutoff_days,
+                "half_life_days": half_life_days,
+                "raw_jobs": raw_jobs,
+                "effective_jobs": effective_jobs,
+                "min_ts": min_ts_dt.isoformat(),
+                "max_ts": t_ref_dt.isoformat(),
             },
-            'categories': category_data,
-            'market_context': market_context,
-            'top_companies': self._extract_top_companies(recent_jobs, top_n),
-            'top_titles': self._extract_top_titles(recent_jobs, top_n),
-            'salary_distribution': self._analyze_salary_distribution(recent_jobs)
+            "weighted_summary": weighted_summary,
+            "top_terms": top_terms,
+            "series": series,
         }
 
-        return overview
+    def _compute_run_weight(self, run_ts: datetime, t_ref: float, half_life_days: float) -> float:
+        """Compute weight for a run using half-life decay."""
+        delta_days = (t_ref - run_ts.timestamp()) / (24 * 3600)
+        return 2 ** (-delta_days / half_life_days)
 
     def _filter_recent_jobs(self, jobs: List[Dict[str, Any]], cutoff_date: datetime) -> List[Dict[str, Any]]:
         """Filter jobs to only include those posted after cutoff date."""

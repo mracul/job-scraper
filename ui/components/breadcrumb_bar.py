@@ -51,17 +51,18 @@ def render_breadcrumb_bar(
 
     with col2:
         # Render actions from right to left
-        action_cols = st.columns(len(actions))
-        for i, action in enumerate(actions):
-            with action_cols[len(actions) - 1 - i]:  # Reverse order for right alignment
-                icon = action.get("icon", "")
-                label = action["label"]
-                on_click = action.get("on_click")
+        if actions:
+            action_cols = st.columns(len(actions))
+            for i, action in enumerate(actions):
+                with action_cols[len(actions) - 1 - i]:  # Reverse order for right alignment
+                    icon = action.get("icon", "")
+                    label = action["label"]
+                    on_click = action.get("on_click")
 
-                button_label = f"{icon} {label}" if icon else label
+                    button_label = f"{icon} {label}" if icon else label
 
-                if st.button(button_label, key=f"action_{i}", use_container_width=True):
-                    on_click()
+                    if st.button(button_label, key=f"action_{i}", use_container_width=True):
+                        on_click()
 
 
 def _shorten_label(label: str, max_length: int = 30) -> str:

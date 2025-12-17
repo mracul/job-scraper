@@ -1,75 +1,114 @@
 """
 Job Scraper - Streamlit UI
 A web interface for running job scrapes and exploring results.
+Phase 7.9: Thin Router + Full Navigation + Cleanup
 """
 
-
 import streamlit as st
-import streamlit.components.v1
-import pandas as pd
-import requests
 import json
-import re
-from markdown import markdown as md_to_html
-import os
-import time
-import subprocess
-import sys
-import shutil
-import hashlib
-import copy
-from pathlib import Path
-from datetime import datetime
-from collections import defaultdict
-import plotly.express as px
 
-# Import the AI summary UI block from the new module
-from ai_summary_ui import render_ai_summary_block
+# Import navigation system
+from ui.navigation.state import defaults, normalize_state
+from ui.navigation.url_sync import apply_state_from_url, sync_url_with_state
 
-# Import views
-from ui.views.reports import render_reports_page
-from ui.views.jobs import render_job_explorer, render_job_detail_view
+# Import router
+from ui.router import dispatch
 
-from ui_core import build_ai_summary_input as _ui_build_ai_summary_input
-from ui_core import merge_analyses as _ui_merge_analyses
-
-from ui.utils import split_tldr, _truncate_text, _hash_payload
-from ui.io_cache import (
-    _load_cached_ai_summary,
-    _save_cached_ai_summary,
-    _load_analysis_cached,
-    load_analysis,
-    _load_text_file_cached,
-    load_requirements_analysis_txt,
-    _load_jobs_csv_cached,
-    load_jobs_csv,
-    _get_run_search_meta,
-)
-
-from storage.compiled_report_store import (
-    build_compiled_report_payload,
-    build_runs_fingerprint,
-    compiled_report_path,
-    is_matching_compiled_report,
-    load_compiled_report,
-    save_compiled_report_atomic,
-)
+# Import sidebar
+from ui.components.sidebar import render_sidebar
 
 
-def render_markdown_scroll(md: str, *, height_px: int = 260) -> None:
-    html = md_to_html(md or "_No further details._", extensions=["extra", "tables", "sane_lists", "nl2br"])
-    st.markdown(
-        f"<div class='ai-scroll' style='max-height:{height_px}px'>{html}</div>",
-        unsafe_allow_html=True,
+def init_session_state():
+    """Initialize session state with navigation defaults."""
+    # Set navigation defaults
+    nav_defaults = defaults()
+    for key, value in nav_defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+    # Initialize other app-specific state
+    if "run_process" not in st.session_state:
+        st.session_state.run_process = None
+    if "run_log_file" not in st.session_state:
+        st.session_state.run_log_file = None
+    if "delete_candidates" not in st.session_state:
+        st.session_state.delete_candidates = []
+    if "delete_modal_open" not in st.session_state:
+        st.session_state.delete_modal_open = False
+    if "last_url_state" not in st.session_state:
+        st.session_state.last_url_state = None
+    if "nav_seq" not in st.session_state:
+        st.session_state.nav_seq = 0
+    if "nav_origin" not in st.session_state:
+        st.session_state.nav_origin = None
+    if "overview_params" not in st.session_state:
+        st.session_state.overview_params = None
+    if "overview_cache_path" not in st.session_state:
+        st.session_state.overview_cache_path = None
+    if "overview_notice" not in st.session_state:
+        st.session_state.overview_notice = None
+    if "trigger_overview_generation" not in st.session_state:
+        st.session_state.trigger_overview_generation = False
+    if "trigger_overview_export" not in st.session_state:
+        st.session_state.trigger_overview_export = False
+    if "compiled_preexisting" not in st.session_state:
+        st.session_state.compiled_preexisting = False
+
+
+def inject_css():
+    """Inject custom CSS for the application."""
+    st.markdown("""
+    <style>
+    /* Custom styles for the job scraper app */
+    .stButton button {
+        border-radius: 6px;
+    }
+    .stTextInput input, .stNumberInput input, .stSelectbox select {
+        border-radius: 4px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def main():
+    """Main entry point for the Streamlit app - thin router implementation."""
+    st.set_page_config(
+        page_title="Job Scraper",
+        page_icon="🔍",
+        layout="wide",
+        initial_sidebar_state="expanded"
     )
 
+    # One-time initialization
+    init_session_state()
+    inject_css()
 
-# ============================================================================
-# Configuration & Constants
-# ============================================================================
+    # Navigation sync: apply URL state early, before rendering sidebar
+    params = st.query_params
+    params_str = json.dumps(dict(params) if params else {}, sort_keys=True)
 
-from ui_core import STATE_DIR, SETTINGS_FILE, DEFAULT_SETTINGS, _stable_json_dumps, load_settings, save_settings
-from ui.constants import (
+    if st.session_state.get("last_url_state") != params_str:
+        state_changed = apply_state_from_url()
+        st.session_state.last_url_state = params_str
+        if state_changed:
+            normalize_state()
+            st.rerun()
+
+    # Render global sidebar navigation
+    render_sidebar()
+
+    # Normalize state (optional but recommended)
+    normalize_state()
+
+    # Dispatch to the appropriate view
+    dispatch()
+
+    # Sync URL at end of run
+    sync_url_with_state()
+
+
+if __name__ == "__main__":
+    main()
     SCRAPED_DATA_DIR,
     RUN_STATE_FILE,
     LOGS_DIR,
@@ -336,351 +375,6 @@ def init_session_state():
         st.session_state.overview_cache_path = None
     if "overview_notice" not in st.session_state:
         st.session_state.overview_notice = None
-
-
-def _overview_params(cutoff_days: int, half_life_days: int, top_n: int) -> dict:
-    return {
-        "cutoff_days": int(cutoff_days),
-        "half_life_days": int(half_life_days),
-        "top_n": int(top_n),
-    }
-
-
-def _overview_cache_file(params: dict) -> Path:
-    OVERVIEW_DIR.mkdir(parents=True, exist_ok=True)
-    key = _hash_payload({"overview": params})[:16]
-    return OVERVIEW_DIR / f"overview_{key}.json"
-
-
-def _load_overview_cache(path: Path) -> dict | None:
-    if not path.exists():
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-def _save_overview_cache(path: Path, data: dict) -> None:
-    OVERVIEW_DIR.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-def _export_overview_files(*, payload: dict, params: dict) -> dict[str, str]:
-    """Export overview artifacts to outputs/.
-
-    Writes:
-    - overview_<key>.json (full cached payload, plus AI summary text if available)
-    - overview_<key>_series.csv (trend series)
-    - overview_<key>.md (human-readable summary)
-    """
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    key = _hash_payload({"overview": params})[:16]
-    json_path = OUTPUTS_DIR / f"overview_{key}.json"
-    csv_path = OUTPUTS_DIR / f"overview_{key}_series.csv"
-    md_path = OUTPUTS_DIR / f"overview_{key}.md"
-
-    # Best-effort: include AI summary (if already generated)
-    ai_cache = OVERVIEW_DIR / f"ai_{_hash_payload(params)[:16]}.json"
-    ai_text: str | None = None
-    cached_ai = _load_cached_ai_summary(ai_cache)
-    if cached_ai and isinstance(cached_ai.get("summary"), str):
-        ai_text = cached_ai.get("summary")
-
-    export_payload = dict(payload)
-    export_payload["ai_summary"] = ai_text
-    export_payload["exported_at"] = datetime.now().isoformat()
-
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(export_payload, f, indent=2, ensure_ascii=False)
-
-    # CSV series
-    series = payload.get("series")
-    if isinstance(series, list) and series:
-        df = pd.DataFrame(series)
-        # Ensure stable column order
-        cols = [
-            c
-            for c in ["timestamp", "run", "run_order", "category", "term", "count", "pct", "total_jobs"]
-            if c in df.columns
-        ]
-        if cols:
-            df = df[cols]
-        df.to_csv(csv_path, index=False)
-    else:
-        # Still create an empty CSV so exports are predictable
-        pd.DataFrame(columns=["timestamp", "run", "run_order", "category", "term", "count", "pct", "total_jobs"]).to_csv(
-            csv_path, index=False
-        )
-
-    # Markdown report
-    meta = payload.get("meta") or {}
-    runs_used = payload.get("runs") or []
-    runs_count = len(runs_used) if isinstance(runs_used, list) else 0
-    raw_jobs = int(meta.get("raw_jobs", 0) or 0)
-    effective_jobs = float(meta.get("effective_jobs", 0) or 0)
-    cutoff_days = meta.get("cutoff_days", "N/A")
-    half_life_days = meta.get("half_life_days", "N/A")
-    min_ts = meta.get("min_ts", "")
-    max_ts = meta.get("max_ts", "")
-    top_n = params.get("top_n", 10)
-
-    lines: list[str] = []
-    lines.append("# Job Market Overview (Weighted)")
-    lines.append("")
-    lines.append(f"**Cutoff:** {cutoff_days} days  ")
-    lines.append(f"**Half-life:** {half_life_days} days  ")
-    lines.append(f"**Top N terms/category:** {top_n}  ")
-    lines.append(f"**Generated:** {payload.get('generated_at')}")
-    lines.append("")
-    lines.append("## Window Summary")
-    lines.append("")
-    lines.append(f"- Runs included: {runs_count}")
-    lines.append(f"- Raw jobs scanned: {raw_jobs:,}")
-    lines.append(f"- Effective jobs (weighted): {effective_jobs:,.1f}")
-    if min_ts and max_ts:
-        lines.append(f"- Window span: {min_ts[:10]} → {max_ts[:10]}")
-    lines.append("")
-
-    if isinstance(runs_used, list) and runs_used:
-        lines.append("## Runs")
-        lines.append("")
-        for r in runs_used:
-            name = r.get("name")
-            ts = r.get("timestamp", "")[:10] if r.get("timestamp") else ""
-            jobs = r.get("total_jobs") or r.get("job_count")
-            weight = r.get("weight", 1.0)
-            lines.append(f"- {name} ({jobs} jobs, weight: {weight:.3f}) — {ts}")
-        lines.append("")
-
-    # Weighted summary by category
-    weighted_summary = payload.get("weighted_summary") or {}
-    top_terms = payload.get("top_terms") or {}
-    if weighted_summary:
-        lines.append("## Weighted Summary")
-        lines.append("")
-        for cat_key, cat_label in CATEGORY_LABELS.items():
-            terms = top_terms.get(cat_key, [])
-            if not terms:
-                continue
-            cat_data = weighted_summary.get(cat_key, {})
-            lines.append(f"### {cat_label}")
-            lines.append("")
-            lines.append("| Term | Weighted % | Weighted Count |")
-            lines.append("|------|------------|----------------|")
-            for term in terms:
-                item = cat_data.get(term, {})
-                w_pct = item.get("weighted_pct", 0)
-                w_count = item.get("weighted_count", 0)
-                lines.append(f"| {term} | {w_pct:.1f}% | {w_count:.1f} |")
-            lines.append("")
-
-    lines.append("## AI Summary")
-    lines.append("")
-    if ai_text:
-        lines.append(ai_text.strip())
-    else:
-        lines.append("_AI summary not generated yet. Generate it from the Overview page, then export again._")
-    lines.append("")
-
-    md_path.write_text("\n".join(lines), encoding="utf-8")
-
-    return {"json": str(json_path), "csv": str(csv_path), "md": str(md_path)}
-
-
-def _runs_within_cutoff(runs: list[dict], cutoff_days: int) -> list[dict]:
-    """Filter runs to those within cutoff_days of the most recent run."""
-    if not runs:
-        return []
-    # Find t_ref = max timestamp among runs
-    timestamps = []
-    for r in runs:
-        ts = r.get("timestamp")
-        if isinstance(ts, datetime):
-            timestamps.append(ts.timestamp())
-    if not timestamps:
-        return runs
-    t_ref = max(timestamps)
-    cutoff_ts = t_ref - (cutoff_days * 86400)
-    selected = []
-    for r in runs:
-        ts = r.get("timestamp")
-        if isinstance(ts, datetime):
-            if ts.timestamp() >= cutoff_ts:
-                selected.append(r)
-    return selected
-
-
-def _compute_run_weight(run_ts: datetime, t_ref: float, half_life_days: float) -> float:
-    """Compute weight using half-life decay: w_i = 2^(-delta_i / H)."""
-    delta_days = (t_ref - run_ts.timestamp()) / 86400.0
-    return 2.0 ** (-delta_days / half_life_days)
-
-
-def _build_overview_payload(*, runs: list[dict], cutoff_days: int, half_life_days: int, top_n: int) -> dict:
-    """Build overview payload with weighted merge using half-life decay model.
-    
-    Weight formula: w_i = 2^(-delta_i / H)
-    where delta_i = age in days from t_ref, H = half_life_days
-    """
-    usable_runs: list[dict] = []
-    analyses: list[dict] = []
-    run_timestamps: list[float] = []
-
-    for r in runs:
-        run_path = Path(r.get("path"))
-        analysis = load_analysis(run_path)
-        if not analysis:
-            continue
-        total_jobs = int(analysis.get("total_jobs", 0) or 0)
-        summary = analysis.get("summary", {}) or analysis.get("presence", {}) or {}
-        if not isinstance(summary, dict) or (not summary):
-            continue
-        run_ts = r.get("timestamp")
-        if not isinstance(run_ts, datetime):
-            continue
-        run_timestamps.append(run_ts.timestamp())
-        usable_runs.append(
-            {
-                "name": str(r.get("name") or run_path.name),
-                "path": str(run_path),
-                "timestamp": run_ts.isoformat(),
-                "job_count": int(r.get("job_count", total_jobs) or total_jobs),
-                "total_jobs": total_jobs,
-            }
-        )
-        analyses.append({"total_jobs": total_jobs, "summary": summary, "timestamp": run_ts})
-
-    if not usable_runs:
-        return {
-            "generated_at": datetime.now().isoformat(),
-            "runs": [],
-            "meta": {
-                "cutoff_days": cutoff_days,
-                "half_life_days": half_life_days,
-                "raw_jobs": 0,
-                "effective_jobs": 0.0,
-                "min_ts": None,
-                "max_ts": None,
-            },
-            "weighted_summary": {},
-            "top_terms": {},
-            "series": [],
-        }
-
-    # t_ref = max timestamp among usable runs
-    t_ref = max(run_timestamps)
-    t_ref_dt = datetime.fromtimestamp(t_ref)
-    min_ts = min(run_timestamps)
-    min_ts_dt = datetime.fromtimestamp(min_ts)
-
-    # Compute weights and weighted merge
-    raw_jobs = 0
-    effective_jobs = 0.0
-    weighted_counts: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-
-    for analysis in analyses:
-        run_ts = analysis["timestamp"]
-        total_jobs = analysis["total_jobs"]
-        summary = analysis["summary"]
-        weight = _compute_run_weight(run_ts, t_ref, half_life_days)
-
-        raw_jobs += total_jobs
-        effective_jobs += weight * total_jobs
-
-        for cat_key in CATEGORY_LABELS.keys():
-            cat_map = summary.get(cat_key, {}) or {}
-            if not isinstance(cat_map, dict):
-                continue
-            for term, count in cat_map.items():
-                try:
-                    c = int(count or 0)
-                except (ValueError, TypeError):
-                    c = 0
-                weighted_counts[cat_key][term] += weight * c
-
-    # Build weighted summary (weighted_pct = weighted_count / effective_jobs)
-    weighted_summary: dict[str, dict[str, dict]] = {}
-    for cat_key, terms_map in weighted_counts.items():
-        weighted_summary[cat_key] = {}
-        for term, w_count in terms_map.items():
-            w_pct = (w_count / effective_jobs * 100.0) if effective_jobs > 0 else 0.0
-            weighted_summary[cat_key][term] = {
-                "weighted_count": round(w_count, 2),
-                "weighted_pct": round(w_pct, 2),
-            }
-
-    # Decide top-N terms per category by weighted count
-    top_terms_by_cat: dict[str, list[str]] = {}
-    limit = max(1, int(top_n))
-    for cat_key in CATEGORY_LABELS.keys():
-        items = weighted_summary.get(cat_key, {})
-        if not items:
-            top_terms_by_cat[cat_key] = []
-            continue
-        ranked = sorted(items.items(), key=lambda t: t[1].get("weighted_count", 0), reverse=True)
-        top_terms_by_cat[cat_key] = [str(term) for term, _ in ranked[:limit]]
-
-    # Add weights to usable_runs for reference
-    for r in usable_runs:
-        ts_str = r.get("timestamp")
-        if ts_str:
-            try:
-                run_dt = datetime.fromisoformat(ts_str)
-                r["weight"] = round(_compute_run_weight(run_dt, t_ref, half_life_days), 4)
-            except Exception:
-                r["weight"] = 1.0
-
-    # Build per-run time series (for delta computation and heatmaps)
-    per_run_rows: list[dict] = []
-    for idx, r in enumerate(usable_runs):
-        run_path = Path(r["path"])
-        analysis = load_analysis(run_path) or {}
-        total_jobs = int(analysis.get("total_jobs", 0) or 0)
-        summary = analysis.get("summary", {}) or analysis.get("presence", {}) or {}
-        run_ts_str = r.get("timestamp")
-        run_label = r["name"]
-        run_order = idx
-
-        for cat_key, terms in top_terms_by_cat.items():
-            cat_map = (summary.get(cat_key, {}) or {}) if isinstance(summary, dict) else {}
-            if not isinstance(cat_map, dict):
-                continue
-            for term in terms:
-                count = int(cat_map.get(term, 0) or 0)
-                pct = round((float(count) / float(total_jobs) * 100.0), 2) if total_jobs else 0.0
-                per_run_rows.append(
-                    {
-                        "category": cat_key,
-                        "term": term,
-                        "run": run_label,
-                        "run_order": run_order,
-                        "timestamp": run_ts_str,
-                        "count": count,
-                        "pct": pct,
-                        "total_jobs": total_jobs,
-                    }
-                )
-
-    return {
-        "generated_at": datetime.now().isoformat(),
-        "runs": usable_runs,
-        "meta": {
-            "cutoff_days": cutoff_days,
-            "half_life_days": half_life_days,
-            "raw_jobs": raw_jobs,
-            "effective_jobs": round(effective_jobs, 2),
-            "min_ts": min_ts_dt.isoformat(),
-            "max_ts": t_ref_dt.isoformat(),
-        },
-        "weighted_summary": weighted_summary,
-        "top_terms": top_terms_by_cat,
-        "series": per_run_rows,
-    }
 
 
 def _get_query_params() -> dict:
@@ -1103,265 +797,6 @@ def render_breadcrumb():
 # ============================================================================
 # Page: Overview
 # ============================================================================
-
-
-def _render_market_context_bars(weighted_summary: dict, effective_jobs: float) -> None:
-    """Render market context (support levels + work arrangements) as progress bars."""
-    st.subheader("📊 Market Context")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("**Support Levels**")
-        support_data = weighted_summary.get("support_levels", {})
-        if support_data:
-            # Sort by weighted_pct descending
-            sorted_items = sorted(support_data.items(), key=lambda x: x[1].get("weighted_pct", 0), reverse=True)
-            for term, data in sorted_items[:6]:
-                pct = data.get("weighted_pct", 0)
-                st.progress(min(pct / 100.0, 1.0), text=f"{term}: {pct:.1f}%")
-        else:
-            st.caption("No support level data available.")
-
-    with col2:
-        st.markdown("**Work Arrangements**")
-        work_data = weighted_summary.get("work_arrangements", {})
-        if work_data:
-            sorted_items = sorted(work_data.items(), key=lambda x: x[1].get("weighted_pct", 0), reverse=True)
-            for term, data in sorted_items[:6]:
-                pct = data.get("weighted_pct", 0)
-                st.progress(min(pct / 100.0, 1.0), text=f"{term}: {pct:.1f}%")
-        else:
-            st.caption("No work arrangement data available.")
-
-
-def _render_category_snapshot(
-    cat_key: str,
-    cat_label: str,
-    weighted_summary: dict,
-    top_terms: list[str],
-    series: list[dict] | None = None,
-) -> None:
-    """Render a category as a simple snapshot table.
-
-    `series` is accepted for forward-compatibility (some callers pass it) but is
-    not currently used by the table snapshot view.
-    """
-    cat_data = weighted_summary.get(cat_key, {})
-    if not cat_data or not top_terms:
-        return
-
-    with st.expander(cat_label, expanded=False):
-        table_data = []
-        for term in top_terms:
-            item = cat_data.get(term, {})
-            w_pct = item.get("weighted_pct", 0)
-            w_count = item.get("weighted_count", 0)
-            table_data.append(
-                {
-                    "Term": term,
-                    "Weighted %": f"{w_pct:.1f}%",
-                    "W.Count": f"{w_count:.1f}",
-                }
-            )
-        df_table = pd.DataFrame(table_data)
-        st.dataframe(df_table, use_container_width=True, hide_index=True)
-        st.caption(f"Top {len(top_terms)} shown by weighted count.")
-
-
-def render_overview_page():
-    """Render weighted statistical overview across runs."""
-    render_breadcrumb()
-    st.header("📈 Overview")
-
-    runs = list_runs()
-    if not runs:
-        st.info("No reports found yet. Start a new run to generate data.")
-        return
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Controls
-    # ─────────────────────────────────────────────────────────────────────────
-    col1, col2, col3 = st.columns([1.2, 1.2, 0.8])
-    with col1:
-        cutoff_choice = st.selectbox(
-            "Cutoff",
-            options=CUTOFF_LABELS,
-            index=3,  # Default: 180d
-            help="Include runs from the last N days (relative to most recent run).",
-        )
-    with col2:
-        halflife_choice = st.selectbox(
-            "Half-life",
-            options=HALFLIFE_LABELS,
-            index=2,  # Default: 30d
-            help="Weight decay half-life. Older runs contribute less; halved every H days.",
-        )
-    with col3:
-        top_n = st.number_input(
-            "Top N",
-            min_value=3,
-            max_value=50,
-            value=10,
-            step=1,
-            help="Show top N terms per category by weighted count.",
-        )
-
-    cutoff_days = CUTOFF_VALUES[cutoff_choice]
-    half_life_days = HALFLIFE_VALUES[halflife_choice]
-
-    btn_col1, btn_col2 = st.columns([1, 1])
-    with btn_col1:
-        generate = st.button("🔄 Generate / Update", type="primary", use_container_width=True)
-    with btn_col2:
-        params = _overview_params(cutoff_days, half_life_days, int(top_n))
-        cache_file = _overview_cache_file(params)
-        cached = _load_overview_cache(cache_file)
-        export_disabled = (not cached) or (cached.get("params") != params)
-        export_now = st.button(
-            "💾 Export files",
-            disabled=export_disabled,
-            use_container_width=True,
-            help="Writes JSON + CSV + Markdown to outputs/.",
-        )
-
-    # One-shot notices
-    notice = st.session_state.get("overview_notice")
-    if isinstance(notice, str) and notice:
-        st.success(notice)
-        st.session_state.overview_notice = None
-
-    if generate:
-        selected_runs = _runs_within_cutoff(runs, cutoff_days)
-        payload = _build_overview_payload(
-            runs=selected_runs,
-            cutoff_days=cutoff_days,
-            half_life_days=half_life_days,
-            top_n=int(top_n),
-        )
-        payload["params"] = params
-        _save_overview_cache(cache_file, payload)
-        exported = _export_overview_files(payload=payload, params=params)
-        st.session_state.overview_notice = (
-            f"Exported: {Path(exported['md']).name}, {Path(exported['csv']).name}, {Path(exported['json']).name}"
-        )
-        st.session_state.overview_params = params
-        st.session_state.overview_cache_path = str(cache_file)
-        st.rerun()
-        return
-
-    if export_now and cached and cached.get("params") == params:
-        exported = _export_overview_files(payload=cached, params=params)
-        st.session_state.overview_notice = (
-            f"Exported: {Path(exported['md']).name}, {Path(exported['csv']).name}, {Path(exported['json']).name}"
-        )
-        st.rerun()
-        return
-
-    # Validate cache
-    if not cached or cached.get("params") != params:
-        st.caption("Overview not generated for these settings yet. Click **Generate / Update**.")
-        st.stop()
-
-    meta = cached.get("meta") or {}
-    runs_used = cached.get("runs") or []
-    weighted_summary = cached.get("weighted_summary") or {}
-    top_terms = cached.get("top_terms") or {}
-    series = cached.get("series") or []
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Model explanation (UX copy)
-    # ─────────────────────────────────────────────────────────────────────────
-    max_ts = meta.get("max_ts", "")
-    cutoff_date_str = ""
-    if max_ts:
-        try:
-            max_dt = datetime.fromisoformat(max_ts)
-            cutoff_dt = max_dt - pd.Timedelta(days=cutoff_days)
-            cutoff_date_str = cutoff_dt.strftime("%Y-%m-%d")
-        except Exception:
-            cutoff_date_str = f"{cutoff_days}d ago"
-    st.caption(f"Using runs since **{cutoff_date_str}**, weighted by recency (half-life: **{half_life_days}d**).")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Summary Metrics Block
-    # ─────────────────────────────────────────────────────────────────────────
-    st.subheader("📋 Window Summary")
-    runs_count = len(runs_used)
-    raw_jobs = int(meta.get("raw_jobs", 0) or 0)
-    effective_jobs = float(meta.get("effective_jobs", 0) or 0)
-    min_ts = meta.get("min_ts", "")
-    max_ts_display = meta.get("max_ts", "")
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Runs", runs_count)
-    m2.metric("Raw jobs", f"{raw_jobs:,}")
-    m3.metric("Effective jobs", f"{effective_jobs:,.0f}")
-    if min_ts and max_ts_display:
-        span = f"{min_ts[:10]} → {max_ts_display[:10]}"
-    else:
-        span = "—"
-    m4.metric("Span", span)
-
-    st.caption(f"Cutoff: {cutoff_days}d | Half-life: {half_life_days}d | Top N: {top_n}")
-    gen_at = cached.get("generated_at")
-    if gen_at:
-        st.caption(f"Generated: {gen_at}")
-
-    st.markdown("---")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Market Context (support levels + work arrangements)
-    # ─────────────────────────────────────────────────────────────────────────
-    _render_market_context_bars(weighted_summary, effective_jobs)
-
-    st.markdown("---")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Category Snapshots (tables default, with view toggle)
-    # ─────────────────────────────────────────────────────────────────────────
-    st.subheader("📁 Category Snapshots")
-
-    # Exclude market context categories (already shown above)
-    skip_cats = {"support_levels", "work_arrangements"}
-    for cat_key, cat_label in CATEGORY_LABELS.items():
-        if cat_key in skip_cats:
-            continue
-        cat_terms = top_terms.get(cat_key) or []
-        if not cat_terms:
-            continue
-        _render_category_snapshot(cat_key, cat_label, weighted_summary, cat_terms, series)
-
-    st.markdown("---")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # AI Summary (collapsed)
-    # ─────────────────────────────────────────────────────────────────────────
-    with st.expander("🤖 AI Summary (Interpretation)", expanded=False):
-        # Build AI bundle from weighted summary
-        # Convert weighted_summary to simple counts for AI input
-        simple_summary = {}
-        for cat_key, terms_map in weighted_summary.items():
-            simple_summary[cat_key] = {term: int(data.get("weighted_count", 0)) for term, data in terms_map.items()}
-
-        overview_data = {
-            "total_jobs": int(effective_jobs),
-            "summary": simple_summary,
-            "search": {
-                "window": f"Last {cutoff_days} days (half-life {half_life_days}d)",
-                "runs": [r.get("name") for r in runs_used],
-            }
-        }
-
-        from ai.ai_payloads import build_ai_bundle
-        bundle = build_ai_bundle(
-            scope=f"overview_{cutoff_days}d_hl{half_life_days}d",
-            overview=overview_data,
-            limits={"top_n_per_category": int(top_n)},
-            category_labels=CATEGORY_LABELS,
-        )
-        ai_cache = OVERVIEW_DIR / f"ai_{bundle['fingerprint']}.json"
-        render_ai_summary_block(cache_path=ai_cache, ai_input=bundle, auto_generate=False)
 
 
 def render_report_list():
@@ -1942,307 +1377,11 @@ def render_compiled_overview():
 
 
 
-def render_report_overview():
-    """Render the overview of a selected report with charts."""
-    run_path = Path(st.session_state.selected_run)
-    analysis = load_analysis(run_path)
-    
-    st.header(f"📊 Report Overview")
-    
-    if not analysis:
-        st.warning("No analysis data found for this report. Run analysis first.")
-        return
-    
-    summary = analysis.get("summary", {}) or analysis.get("presence", {})
-    total_jobs = analysis.get("total_jobs", 0)
-    
-    # Summary cards
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("Total Jobs", total_jobs)
-    
-    with col2:
-        # Count unique companies from job_details
-        job_details = analysis.get("job_details", [])
-        unique_companies = len(set(j.get("company", "") for j in job_details))
-        st.metric("Companies", unique_companies)
-    
-    with col3:
-        # Top certification
-        certs = summary.get("certifications", {})
-        if certs:
-            top_cert = max(certs, key=certs.get)
-            st.metric("Top Cert", top_cert, f"{certs[top_cert]} jobs")
-        else:
-            st.metric("Top Cert", "N/A")
-    
-    with col4:
-        # Top technical skill
-        skills = summary.get("technical_skills", {})
-        if skills:
-            top_skill = max(skills, key=skills.get)
-            st.metric("Top Skill", top_skill, f"{skills[top_skill]} jobs")
-        else:
-            st.metric("Top Skill", "N/A")
-    
-    st.markdown("---")
-    
-    with st.container(border=True):
-        c1, c2 = st.columns([0.7, 0.3], vertical_alignment="center")
-        with c1:
-            st.markdown("### 🔎 Explore matched jobs")
-            st.caption("Filter, open source links, and review which requirements triggered matches.")
-        with c2:
-            if st.button("Open Job Explorer", type="primary", use_container_width=True):
-                navigate_to(
-                    "reports",
-                    selected_run=st.session_state.selected_run,
-                    view_mode="explorer",
-                    viewing_job_id=None,
-                    selected_filters={},
-                    filter_mode="any",
-                    search_text=""
-                )
-                st.rerun()
-    
-    st.markdown("---")
-
-    # AI summary (single report)
-    keywords, location = _get_run_search_meta(run_path)
-    txt = load_requirements_analysis_txt(run_path)
-    from ai.ai_payloads import build_ai_bundle
-
-    if txt and txt.strip():
-        bundle = build_ai_bundle(
-            scope="single",
-            analysis_text=_truncate_text(
-                txt.strip(),
-                max_chars=80_000,
-                suffix="\n\n[TRUNCATED: requirements_analysis.txt exceeded limit]",
-            ),
-            meta={
-                "scope": "single",
-                "run": run_path.name,
-                "keywords": keywords,
-                "location": location,
-                "total_jobs": int(total_jobs or 0),
-                "companies": int(unique_companies or 0),
-            },
-            limits={"top_n_per_category": AI_SUMMARY_TOP_N_SINGLE},
-            category_labels=CATEGORY_LABELS,
-        )
-    else:
-        # Fallback for older runs missing requirements_analysis.txt
-        overview_data = {
-            "total_jobs": total_jobs,
-            "summary": summary,
-            "search": {
-                "run": run_path.name,
-                "keywords": keywords,
-                "location": location,
-            }
-        }
-        bundle = build_ai_bundle(
-            scope="single",
-            overview=overview_data,
-            limits={"top_n_per_category": AI_SUMMARY_TOP_N_SINGLE},
-            category_labels=CATEGORY_LABELS,
-        )
-    cache_path = run_path / "ai_summary.json"
-    render_ai_summary_block(cache_path=cache_path, ai_input=bundle)
-
-    st.markdown("---")
-    
-    # Category charts in expanders with clickable requirements
-    for category_key, category_label in CATEGORY_LABELS.items():
-        data = summary.get(category_key, {})
-        if not data:
-            continue
-        
-        # Keep expander expanded if there's an active selection in this category
-        has_selection = bool(st.session_state.get(f"report_selected_term_{category_key}"))
-        
-        with st.expander(f"{category_label} ({len(data)} items)", expanded=has_selection):
-            # Prepare data for chart
-            sorted_items_full = sorted(data.items(), key=lambda x: x[1], reverse=True)
-            sorted_items = sorted_items_full[:15]  # Top 15
-            df = pd.DataFrame([
-                {"term": term, "count": count, "percentage": (count / total_jobs * 100) if total_jobs > 0 else 0}
-                for term, count in sorted_items
-            ])
-
-            df_full = pd.DataFrame([
-                {"term": term, "count": count, "percentage": (count / total_jobs * 100) if total_jobs > 0 else 0}
-                for term, count in sorted_items_full
-            ])
-            
-            if not df.empty:
-                st.caption("Select a requirement row to view matching jobs:")
-                table_df = df[["term", "count", "percentage"]].rename(
-                    columns={"term": "Requirement", "count": "Jobs", "percentage": "% of Total"}
-                )
-                table_state = st.dataframe(
-                    table_df,
-                    hide_index=True,
-                    use_container_width=True,
-                    selection_mode="single-row",
-                    on_select="rerun",
-                    key=f"report_table_{category_key}",
-                )
-
-                selected_rows = []
-                try:
-                    selected_rows = (table_state.selection.rows or []) if table_state and table_state.selection else []
-                except Exception:
-                    selected_rows = []
-                selected_term_key = f"report_selected_term_{category_key}"
-                if selected_rows:
-                    row_idx = selected_rows[0]
-                    if 0 <= row_idx < len(df):
-                        st.session_state[selected_term_key] = str(df.iloc[row_idx]["term"])
-
-                selected_term = st.session_state.get(selected_term_key)
-                if selected_term and st.button(
-                    "View matching jobs",
-                    type="primary",
-                    use_container_width=True,
-                    key=f"report_view_jobs_{category_key}",
-                ):
-                    navigate_to(
-                        "reports",
-                        selected_run=st.session_state.selected_run,
-                        view_mode="explorer",
-                        viewing_job_id=None,
-                        selected_filters={category_key: [selected_term]},
-                        filter_mode="any",
-                        search_text="",
-                    )
-                    st.rerun()
-
-                if len(sorted_items_full) > 15 and st.button(
-                    "⤢ Expand list",
-                    use_container_width=True,
-                    key=f"report_expand_{category_key}",
-                ):
-                    if hasattr(st, "dialog"):
-                        @st.dialog(f"{category_label} — All Items")
-                        def _show_report_full_table(cat_key: str, df_all: pd.DataFrame):
-                            st.caption("Select a requirement row to view matching jobs:")
-                            table_df_full = df_all[["term", "count", "percentage"]].rename(
-                                columns={"term": "Requirement", "count": "Jobs", "percentage": "% of Total"}
-                            )
-                            table_state_full = st.dataframe(
-                                table_df_full,
-                                hide_index=True,
-                                use_container_width=True,
-                                height=520,
-                                selection_mode="single-row",
-                                on_select="rerun",
-                                key=f"report_table_full_{cat_key}",
-                            )
-
-                            selected_rows_full = []
-                            try:
-                                selected_rows_full = (
-                                    (table_state_full.selection.rows or [])
-                                    if table_state_full and table_state_full.selection
-                                    else []
-                                )
-                            except Exception:
-                                selected_rows_full = []
-                            selected_term_key_full = f"report_selected_term_full_{cat_key}"
-                            if selected_rows_full:
-                                row_idx_full = selected_rows_full[0]
-                                if 0 <= row_idx_full < len(df_all):
-                                    st.session_state[selected_term_key_full] = str(df_all.iloc[row_idx_full]["term"])
-
-                            selected_term_full = st.session_state.get(selected_term_key_full)
-                            if selected_term_full and st.button(
-                                "View matching jobs",
-                                type="primary",
-                                use_container_width=True,
-                                key=f"report_view_jobs_full_{cat_key}",
-                            ):
-                                navigate_to(
-                                    "reports",
-                                    selected_run=st.session_state.selected_run,
-                                    view_mode="explorer",
-                                    viewing_job_id=None,
-                                    selected_filters={cat_key: [selected_term_full]},
-                                    filter_mode="any",
-                                    search_text="",
-                                )
-                                st.rerun()
-
-                        _show_report_full_table(category_key, df_full)
-                    else:
-                        with st.expander("All items", expanded=True):
-                            table_df_full = df_full[["term", "count", "percentage"]].rename(
-                                columns={"term": "Requirement", "count": "Jobs", "percentage": "% of Total"}
-                            )
-                            table_state_full = st.dataframe(
-                                table_df_full,
-                                hide_index=True,
-                                use_container_width=True,
-                                height=520,
-                                selection_mode="single-row",
-                                on_select="rerun",
-                                key=f"report_table_full_{category_key}",
-                            )
-
-                            selected_rows_full = []
-                            try:
-                                selected_rows_full = (
-                                    (table_state_full.selection.rows or [])
-                                    if table_state_full and table_state_full.selection
-                                    else []
-                                )
-                            except Exception:
-                                selected_rows_full = []
-                            selected_term_key_full = f"report_selected_term_full_{category_key}"
-                            if selected_rows_full:
-                                row_idx_full = selected_rows_full[0]
-                                if 0 <= row_idx_full < len(df_full):
-                                    st.session_state[selected_term_key_full] = str(df_full.iloc[row_idx_full]["term"])
-
-                            selected_term_full = st.session_state.get(selected_term_key_full)
-                            if selected_term_full and st.button(
-                                "View matching jobs",
-                                type="primary",
-                                use_container_width=True,
-                                key=f"report_view_jobs_full_{category_key}",
-                            ):
-                                navigate_to(
-                                    "reports",
-                                    selected_run=st.session_state.selected_run,
-                                    view_mode="explorer",
-                                    viewing_job_id=None,
-                                    selected_filters={category_key: [selected_term_full]},
-                                    filter_mode="any",
-                                    search_text="",
-                                )
-                                st.rerun()
-
-
 # ============================================================================
-# Page: New Run
+# Page: Settings
 # ============================================================================
 
-def render_new_run_page():
-    """Render the new run configuration page."""
-    render_breadcrumb()
-    
-    st.header("🚀 Start New Scraping Run")
-    
-    settings = load_settings()
-    scraper_settings = settings.get("scraper", {})
-    ui_settings = settings.get("ui", {})
-    
-    # Check if a run is in progress (either in session or persisted)
-    if st.session_state.run_process is not None or load_run_state() is not None:
-        render_run_progress()
-        return
+def render_settings_page():
     
     # ─────────────────────────────────────────────────────────────────────────
     # Search Mode Selection
@@ -2699,9 +1838,12 @@ def render_run_progress():
 
 def render_settings_page():
     """Render the settings page."""
-    render_breadcrumb()
-    
-    st.header("⚙️ Settings")
+    # Canonical page layout: PageHeader, ActionBar (optional), content
+    render_page_header(
+        path=[{"label": "Settings", "active": True}],
+        title="Settings",
+        subtitle="Configure application preferences and defaults"
+    )
     
     settings = load_settings()
     scraper_settings = settings.get("scraper", {})
@@ -2836,9 +1978,6 @@ def render_settings_page():
         with col2:
             if st.form_submit_button("🔄 Reset to Defaults", use_container_width=True):
                 save_settings(DEFAULT_SETTINGS)
-                st.success("Settings reset to defaults!")
-                st.rerun()
-
 
 # ============================================================================
 # Main Application

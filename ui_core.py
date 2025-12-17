@@ -4,6 +4,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 import json
 import copy
+from datetime import datetime
 
 
 # Settings management
@@ -162,3 +163,68 @@ def merge_analyses(analyses: list[dict], *, category_keys: Iterable[str]) -> dic
         "total_jobs": total_jobs,
         "job_details": combined_job_details,
     }
+
+
+def list_runs() -> list[dict]:
+    """List all scraping runs with metadata, newest first."""
+    SCRAPED_DATA_DIR = Path(__file__).parent / "scraped_data"
+    
+    if not SCRAPED_DATA_DIR.exists():
+        return []
+    
+    runs = []
+    for folder in SCRAPED_DATA_DIR.iterdir():
+        if not folder.is_dir():
+            continue
+        
+        meta = {
+            "path": folder,
+            "name": folder.name,
+            "keywords": None,
+            "location": None,
+            "job_count": 0,
+            "timestamp": None,
+            "has_analysis": False
+        }
+        
+        # Parse timestamp from folder name
+        parts = folder.name.rsplit("_", 2)
+        if len(parts) >= 2:
+            try:
+                ts_str = f"{parts[-2]}_{parts[-1]}"
+                meta["timestamp"] = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+            except ValueError:
+                pass
+
+        if meta["timestamp"] is None:
+            meta["timestamp"] = datetime.fromtimestamp(folder.stat().st_mtime)
+        
+        # Read metadata from compiled_jobs.md header
+        compiled_md = folder / "compiled_jobs.md"
+        if compiled_md.exists():
+            try:
+                with open(compiled_md, "r", encoding="utf-8") as f:
+                    for _ in range(10):
+                        line = f.readline()
+                        if not line:
+                            break
+                        if line.startswith("**Search Keywords:**"):
+                            meta["keywords"] = line.replace("**Search Keywords:**", "").strip().rstrip("  ")
+                        elif line.startswith("**Search Location:**"):
+                            meta["location"] = line.replace("**Search Location:**", "").strip().rstrip("  ")
+                        elif line.startswith("**Total Jobs:**"):
+                            try:
+                                meta["job_count"] = int(line.replace("**Total Jobs:**", "").strip())
+                            except ValueError:
+                                pass
+            except Exception:
+                pass
+        
+        # Check for analysis files
+        meta["has_analysis"] = (folder / "requirements_analysis.json").exists()
+        
+        runs.append(meta)
+    
+    # Sort by timestamp descending
+    runs.sort(key=lambda r: r["timestamp"] or datetime.min, reverse=True)
+    return runs

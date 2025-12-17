@@ -11,15 +11,16 @@ from datetime import datetime
 from collections import defaultdict
 
 # Import data loading functions
-from ui.io_cache import load_analysis, load_jobs_csv
+from ui.io_cache import load_analysis, load_jobs_csv, _get_run_search_meta
 
-# Import constants
-from ui.constants import CATEGORY_LABELS
+# Import components
+from ui.components.page_header import render_page_header
 
 
-def navigate_to(*args, **kwargs):
-    """Placeholder - will be imported from main app"""
-    pass
+# Import navigation functions
+from ui.navigation.actions import navigate_to
+from ui.navigation.breadcrumbs import build_breadcrumbs
+from ui.navigation.state import snapshot_state
 
 
 def render_job_explorer():
@@ -28,7 +29,17 @@ def render_job_explorer():
     analysis = load_analysis(run_path)
     jobs_df = load_jobs_csv(run_path)
 
-    st.header("🔍 Job Explorer")
+    # Get run metadata for breadcrumb
+    keywords, location = _get_run_search_meta(run_path)
+    run_display_name = f"{keywords} — {location}" if keywords and location else run_path.name
+
+    # Canonical page layout: PageHeader, ActionBar (optional), content
+    breadcrumbs = build_breadcrumbs(snapshot_state())
+    render_page_header(
+        path=breadcrumbs,
+        title="Job Explorer",
+        subtitle=f"Browse and filter {len(jobs_df) if jobs_df is not None else 0} jobs from {run_display_name}"
+    )
 
     if not analysis or jobs_df is None:
         st.warning("Missing data for job exploration.")
@@ -268,9 +279,19 @@ def render_job_detail_view():
         return
 
     job_row = jobs_df.iloc[csv_idx]
+    job_title = job_row.get("title", "Unknown Job")
 
-    # Header card
-    st.header(job_row.get("title", "Unknown Job"))
+    # Get run metadata for breadcrumb
+    keywords, location = _get_run_search_meta(run_path)
+    run_display_name = f"{keywords} — {location}" if keywords and location else run_path.name
+
+    # Canonical page layout: PageHeader, ActionBar (optional), content
+    breadcrumbs = build_breadcrumbs(snapshot_state())
+    render_page_header(
+        path=breadcrumbs,
+        title=job_title,
+        subtitle=f"Job details from {run_display_name}"
+    )
     st.subheader(f"🏢 {job_row.get('company', 'Unknown Company')}")
 
     # Metadata row
