@@ -8,15 +8,10 @@ from __future__ import annotations
 
 import json
 
-import streamlit as st
-
-from ui.components.sidebar import render_sidebar
 from ui.constants import (
     CATEGORY_LABELS,
 )
 from ui.navigation.state import defaults, normalize_state
-from ui.navigation.url_sync import apply_state_from_url, sync_url_with_state
-from ui.router import dispatch
 from ui.io_cache import load_analysis
 from ui_core import build_ai_summary_input as _ui_build_ai_summary_input
 from ui_core import merge_analyses as _ui_merge_analyses
@@ -29,6 +24,8 @@ from ui_core import merge_analyses as _ui_merge_analyses
 
 def init_session_state() -> None:
     """Initialize session state with navigation defaults and app flags."""
+    import streamlit as st
+
     nav_defaults = defaults()
     for key, value in nav_defaults.items():
         if key not in st.session_state:
@@ -69,6 +66,8 @@ def init_session_state() -> None:
 
 def inject_css() -> None:
     """Inject custom CSS for the application."""
+    import streamlit as st
+
     st.markdown(
         """
     <style>
@@ -92,6 +91,11 @@ def inject_css() -> None:
 
 def main() -> None:
     """Main entry point for the Streamlit app - thin router implementation."""
+    import streamlit as st
+    from ui.components.sidebar import render_sidebar
+    from ui.navigation.url_sync import apply_state_from_url, sync_url_with_state
+    from ui.router import dispatch
+
     st.set_page_config(
         page_title="Job Scraper",
         page_icon="🔍",

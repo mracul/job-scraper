@@ -4,15 +4,15 @@ Navigation actions for the job scraper app.
 Centralized functions for changing navigation state and URL.
 """
 
-import streamlit as st
 from typing import Optional
 
-from .state import apply_state, defaults
+from .state import apply_state, defaults, _st
 from .url_sync import sync_url_with_state
 
 
 def navigate_to(page: str, **kwargs) -> None:
     """Navigate to a page with optional state parameters."""
+    st = _st()
     # Start with defaults for the target page
     new_state = defaults()
     new_state["page"] = page
