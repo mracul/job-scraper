@@ -487,23 +487,24 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
             # Fallback for older Streamlit versions without `height`/`border` params
             st.markdown(summary_text)
 
-    col1, col2, col3, _ = st.columns([1.1, 1, 1, 1.9])
+    # Top right button controls
+    _, col1, col2, col3 = st.columns([3, 1, 1, 1])  # Push buttons to the right
     with col1:
         label = "Regenerate" if summary_text else "Generate"
         if st.session_state.get(inflight_key):
             st.info("Generating summary…")
             if st.button(
-                "Reset",
+                "🔄",
                 use_container_width=True,
                 key=f"reset_{cache_path.name}_{input_hash[:8]}",
-                help="Clears a stuck in-progress state so you can generate again.",
+                help="Reset stuck generation",
             ):
                 st.session_state[inflight_key] = False
                 st.session_state.pop(inflight_started_key, None)
                 st.session_state[auto_key] = False
                 st.rerun()
         else:
-            if st.button(f"✨ {label} summary", use_container_width=True, key=f"gen_{cache_path.name}_{input_hash[:8]}"):
+            if st.button("🔄", use_container_width=True, key=f"gen_{cache_path.name}_{input_hash[:8]}", help=f"{label} AI summary"):
                 st.session_state[auto_key] = False
                 st.session_state[inflight_key] = True
                 st.session_state[inflight_started_key] = time.time()
@@ -530,14 +531,14 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
                     st.session_state.pop(inflight_started_key, None)
                     st.error(str(e))
     with col2:
-        if cached_text and st.button("🧹 Clear", use_container_width=True, key=f"clr_{cache_path.name}_{input_hash[:8]}"):
+        if cached_text and st.button("🗑️", use_container_width=True, key=f"clr_{cache_path.name}_{input_hash[:8]}", help="Clear cached summary"):
             try:
                 cache_path.unlink(missing_ok=True)
             except Exception:
                 pass
             st.rerun()
     with col3:
-        if summary_text and st.button("⤢ Expand", use_container_width=True, key=f"exp_{cache_path.name}_{input_hash[:8]}"):
+        if summary_text and st.button("⤢", use_container_width=True, key=f"exp_{cache_path.name}_{input_hash[:8]}", help="Expand AI summary"):
             if hasattr(st, "dialog"):
                 @st.dialog("🤖 AI Summary")
                 def _show_ai_summary_dialog(text: str):
