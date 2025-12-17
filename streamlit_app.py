@@ -612,33 +612,32 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
             st.error(str(exc))
             summary_text = None
 
+
+    # ===== UI CARD =====
     st.markdown("""
     <style>
-    /* --- AI Summary: remove the inner 'card' look --- */
-    .ai-summary div[data-testid="stMarkdown"],
-    .ai-summary div[data-testid="stMarkdownContainer"],
-    .ai-summary div[data-testid="stMarkdownContainer"] > div,
-    .ai-summary div[data-testid="stMarkdown"] > div {
+    /* kill the inner panel around the height-limited container */
+    .ai-summary div[data-testid="stVerticalBlockBorderWrapper"],
+    .ai-summary div[data-testid="stVerticalBlockBorderWrapper"] * {
     background: transparent !important;
     border: 0 !important;
     border-radius: 0 !important;
     box-shadow: none !important;
     }
 
-    /* Sometimes the scroll container adds a background/radius */
-    .ai-summary div[data-testid="stContainer"] {
+    /* keep markdown flat too */
+    .ai-summary div[data-testid="stMarkdownContainer"],
+    .ai-summary div[data-testid="stMarkdown"],
+    .ai-summary div[data-testid="stMarkdownContainer"] > div {
     background: transparent !important;
-    }
-
-    /* Keep the outer bordered card intact: only flatten INNER wrappers */
-    .ai-summary div[data-testid="stContainer"][style*="border"] {
-    background: unset !important; /* don't break your card */
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
     }
     </style>
     """, unsafe_allow_html=True)
 
-
-    # ===== UI CARD =====
+    st.markdown("<div class='ai-summary'>", unsafe_allow_html=True)
     with st.container(border=True):
         # Header row (title + status on left, toolbar on right)
         left, right = st.columns([0.72, 0.28], vertical_alignment="center")
@@ -741,6 +740,8 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
                 st.markdown(rest_md or "_No further details._")
         else:
             st.markdown("_No summary yet._")
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ============================================================================
 # Settings Persistence
