@@ -1945,7 +1945,7 @@ def render_report_list():
             # Metadata line
             meta_parts = []
             if run["job_count"]:
-                meta_parts.append(f"{run['job_count']}")
+                meta_parts.append(f"{run['job_count']} jobs")
             if run["timestamp"]:
                 meta_parts.append(run["timestamp"].strftime("%m/%d %H:%M"))
             if run["has_analysis"]:
