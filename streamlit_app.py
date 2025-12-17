@@ -1919,70 +1919,67 @@ def render_report_list():
     selected_paths: list[str] = []
 
     for run in runs:
-        with st.container():
-            col0, col1, col2, col3 = st.columns([0.6, 3, 1, 1])
+        col0, col1, col2, col3 = st.columns([0.6, 3, 1, 1])
 
-            with col0:
-                checked = st.checkbox(
-                    f"Select report: {run['name']}",
-                    value=(str(run["path"]) in st.session_state.selected_reports),
-                    key=f"sel_{run['name']}",
-                    label_visibility="hidden"
+        with col0:
+            checked = st.checkbox(
+                f"Select report: {run['name']}",
+                value=(str(run["path"]) in st.session_state.selected_reports),
+                key=f"sel_{run['name']}",
+                label_visibility="hidden"
+            )
+            if checked:
+                selected_paths.append(str(run["path"]))
+        
+        with col1:
+            # Build display label
+            if run["keywords"] and run["keywords"] != "Not specified":
+                label = f"**{run['keywords']}**"
+                if run["location"] and run["location"] != "Not specified":
+                    label += f" — {run['location']}"
+            else:
+                label = f"**{run['name']}**"
+            
+            st.markdown(label)
+            
+            # Metadata line
+            meta_parts = []
+            if run["job_count"]:
+                meta_parts.append(f"{run['job_count']} jobs")
+            if run["timestamp"]:
+                meta_parts.append(run["timestamp"].strftime("%Y-%m-%d %H:%M"))
+            if run["has_analysis"]:
+                meta_parts.append("✅ Analyzed")
+            else:
+                meta_parts.append("⚠️ No analysis")
+            
+            st.caption(" • ".join(meta_parts))
+        
+        with col2:
+            if st.button("View", key=f"view_{run['name']}", use_container_width=True):
+                navigate_to(
+                    "reports",
+                    selected_run=str(run["path"]),
+                    view_mode="overview",
+                    viewing_job_id=None,
+                    selected_filters={},
+                    filter_mode="any",
+                    search_text=""
                 )
-                if checked:
-                    selected_paths.append(str(run["path"]))
-            
-            with col1:
-                # Build display label
-                if run["keywords"] and run["keywords"] != "Not specified":
-                    label = f"**{run['keywords']}**"
-                    if run["location"] and run["location"] != "Not specified":
-                        label += f" — {run['location']}"
-                else:
-                    label = f"**{run['name']}**"
-                
-                st.markdown(label)
-                
-                # Metadata line
-                meta_parts = []
-                if run["job_count"]:
-                    meta_parts.append(f"{run['job_count']} jobs")
-                if run["timestamp"]:
-                    meta_parts.append(run["timestamp"].strftime("%Y-%m-%d %H:%M"))
-                if run["has_analysis"]:
-                    meta_parts.append("✅ Analyzed")
-                else:
-                    meta_parts.append("⚠️ No analysis")
-                
-                st.caption(" • ".join(meta_parts))
-            
-            with col2:
-                if st.button("View", key=f"view_{run['name']}", use_container_width=True):
-                    navigate_to(
-                        "reports",
-                        selected_run=str(run["path"]),
-                        view_mode="overview",
-                        viewing_job_id=None,
-                        selected_filters={},
-                        filter_mode="any",
-                        search_text=""
-                    )
-                    st.rerun()
-            
-            with col3:
-                if st.button("Explore", key=f"explore_{run['name']}", use_container_width=True):
-                    navigate_to(
-                        "reports",
-                        selected_run=str(run["path"]),
-                        view_mode="explorer",
-                        viewing_job_id=None,
-                        selected_filters={},
-                        filter_mode="any",
-                        search_text=""
-                    )
-                    st.rerun()
-
-            st.markdown("---")
+                st.rerun()
+        
+        with col3:
+            if st.button("Explore", key=f"explore_{run['name']}", use_container_width=True):
+                navigate_to(
+                    "reports",
+                    selected_run=str(run["path"]),
+                    view_mode="explorer",
+                    viewing_job_id=None,
+                    selected_filters={},
+                    filter_mode="any",
+                    search_text=""
+                )
+                st.rerun()
 
     st.session_state.selected_reports = selected_paths
 
