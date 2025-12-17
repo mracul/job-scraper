@@ -2545,18 +2545,23 @@ def render_report_overview():
     
     st.markdown("---")
     
-    # Button to go to Job Explorer
-    if st.button("🔍 Open Job Explorer", type="primary"):
-        navigate_to(
-            "reports",
-            selected_run=st.session_state.selected_run,
-            view_mode="explorer",
-            viewing_job_id=None,
-            selected_filters={},
-            filter_mode="any",
-            search_text=""
-        )
-        st.rerun()
+    with st.container(border=True):
+        c1, c2 = st.columns([0.7, 0.3], vertical_alignment="center")
+        with c1:
+            st.markdown("### 🔎 Explore matched jobs")
+            st.caption("Filter, open source links, and review which requirements triggered matches.")
+        with c2:
+            if st.button("Open Job Explorer", type="primary", use_container_width=True):
+                navigate_to(
+                    "reports",
+                    selected_run=st.session_state.selected_run,
+                    view_mode="explorer",
+                    viewing_job_id=None,
+                    selected_filters={},
+                    filter_mode="any",
+                    search_text=""
+                )
+                st.rerun()
     
     st.markdown("---")
 
