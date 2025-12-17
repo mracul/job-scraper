@@ -29,22 +29,17 @@ def render_page_header(
         render_breadcrumb_bar(path)
 
     # Main header content
-    if status:
-        header_cols = st.columns([4, 1])
-    else:
-        header_cols = st.columns(1)
+    title_col, badge_col = st.columns([5, 1])
 
-    with header_cols[0]:
-        title_size = "h2" if not compact else "h3"
-        st.markdown(f"## {title}", unsafe_allow_html=True)
+    with title_col:
+        st.markdown(f"## {title}")
 
         if subtitle:
-            st.markdown(f"*{subtitle}*")
+            st.caption(subtitle)
 
     if status:
-        with header_cols[1]:
+        with badge_col:
             render_status_badge(status)
 
-    # Divider
     if divider:
         st.divider()
