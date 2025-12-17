@@ -1945,13 +1945,13 @@ def render_report_list():
             # Metadata line
             meta_parts = []
             if run["job_count"]:
-                meta_parts.append(f"{run['job_count']} 💼")
+                meta_parts.append(f"{run['job_count']}")
             if run["timestamp"]:
                 meta_parts.append(run["timestamp"].strftime("%m/%d %H:%M"))
             if run["has_analysis"]:
-                meta_parts.append("✓")
+                meta_parts.append("✅")
             else:
-                meta_parts.append("⚠")
+                meta_parts.append("❌")
             
             st.caption(" • ".join(meta_parts))
         with col2:
