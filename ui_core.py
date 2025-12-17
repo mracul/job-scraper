@@ -182,9 +182,12 @@ def list_runs() -> list[dict]:
             "name": folder.name,
             "keywords": None,
             "location": None,
+            "search_mode": None,
+            "bundle_ids": [],
+            "bundle_keywords": [],
             "job_count": 0,
             "timestamp": None,
-            "has_analysis": False
+            "has_analysis": False,
         }
         
         # Parse timestamp from folder name
@@ -204,25 +207,52 @@ def list_runs() -> list[dict]:
         if compiled_md.exists():
             try:
                 with open(compiled_md, "r", encoding="utf-8") as f:
-                    for _ in range(10):
+                    in_keyword_section = False
+                    for _ in range(60):
                         line = f.readline()
                         if not line:
                             break
-                        if line.startswith("**Search Keywords:**"):
-                            meta["keywords"] = line.replace("**Search Keywords:**", "").strip().rstrip("  ")
-                        elif line.startswith("**Search Location:**"):
-                            meta["location"] = line.replace("**Search Location:**", "").strip().rstrip("  ")
-                        elif line.startswith("**Total Jobs:**"):
+
+                        stripped = line.strip()
+                        if stripped.startswith("**Search Keywords:**"):
+                            meta["keywords"] = stripped.replace("**Search Keywords:**", "").strip().rstrip("  ")
+                        elif stripped.startswith("**Search Location:**"):
+                            meta["location"] = stripped.replace("**Search Location:**", "").strip().rstrip("  ")
+                        elif stripped.startswith("**Search Mode:**"):
+                            meta["search_mode"] = stripped.replace("**Search Mode:**", "").strip().lower()
+                        elif stripped.startswith("**Bundle IDs:**"):
+                            ids_raw = stripped.replace("**Bundle IDs:**", "").strip()
+                            meta["bundle_ids"] = [p.strip() for p in ids_raw.split(",") if p.strip()]
+                        elif stripped.startswith("**Keyword Phrases:**"):
+                            in_keyword_section = True
+                            continue
+                        elif stripped.startswith("**Total Jobs:**"):
                             try:
-                                meta["job_count"] = int(line.replace("**Total Jobs:**", "").strip())
+                                meta["job_count"] = int(stripped.replace("**Total Jobs:**", "").strip())
                             except ValueError:
                                 pass
+
+                        if in_keyword_section and stripped.startswith("- "):
+                            meta["bundle_keywords"].append(stripped[2:].strip())
+                        elif in_keyword_section and (not stripped or stripped.startswith("**")):
+                            in_keyword_section = False
             except Exception:
                 pass
-        
+
         # Check for analysis files
         meta["has_analysis"] = (folder / "requirements_analysis.json").exists()
-        
+
+        # Display-friendly name for UI rows
+        if meta.get("search_mode") == "bundle" and meta.get("bundle_ids"):
+            meta["display_name"] = meta["bundle_ids"][0]
+        elif meta.get("keywords"):
+            if meta.get("location") and meta.get("location") != "Not specified":
+                meta["display_name"] = f"{meta['keywords']} — {meta['location']}"
+            else:
+                meta["display_name"] = meta["keywords"]
+        else:
+            meta["display_name"] = folder.name
+
         runs.append(meta)
     
     # Sort by timestamp descending
