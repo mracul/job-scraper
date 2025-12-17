@@ -1919,7 +1919,7 @@ def render_report_list():
     selected_paths: list[str] = []
 
     for run in runs:
-        col0, col1, col2, col3 = st.columns([0.6, 3, 1, 1])
+        col0, col1, col2, col3 = st.columns([0.5, 4, 1, 1])
 
         with col0:
             checked = st.checkbox(
@@ -1932,7 +1932,7 @@ def render_report_list():
                 selected_paths.append(str(run["path"]))
         
         with col1:
-            # Build display label
+            # Build compact display label
             if run["keywords"] and run["keywords"] != "Not specified":
                 label = f"**{run['keywords']}**"
                 if run["location"] and run["location"] != "Not specified":
@@ -1940,23 +1940,22 @@ def render_report_list():
             else:
                 label = f"**{run['name']}**"
             
-            st.markdown(label)
+            st.markdown(label, help=f"Report: {run['name']}")
             
-            # Metadata line
+            # Compact single-line metadata
             meta_parts = []
             if run["job_count"]:
                 meta_parts.append(f"{run['job_count']} jobs")
             if run["timestamp"]:
-                meta_parts.append(run["timestamp"].strftime("%Y-%m-%d %H:%M"))
+                meta_parts.append(run["timestamp"].strftime("%m/%d %H:%M"))
             if run["has_analysis"]:
-                meta_parts.append("✅ Analyzed")
+                meta_parts.append("✅")
             else:
-                meta_parts.append("⚠️ No analysis")
+                meta_parts.append("⚠️")
             
             st.caption(" • ".join(meta_parts))
-        
         with col2:
-            if st.button("View", key=f"view_{run['name']}", use_container_width=True):
+            if st.button("View", key=f"view_{run['name']}", use_container_width=True, help=f"View overview for {run['name']}"):
                 navigate_to(
                     "reports",
                     selected_run=str(run["path"]),
@@ -1969,7 +1968,7 @@ def render_report_list():
                 st.rerun()
         
         with col3:
-            if st.button("Explore", key=f"explore_{run['name']}", use_container_width=True):
+            if st.button("Explore", key=f"explore_{run['name']}", use_container_width=True, help=f"Explore jobs for {run['name']}"):
                 navigate_to(
                     "reports",
                     selected_run=str(run["path"]),
@@ -1980,6 +1979,8 @@ def render_report_list():
                     search_text=""
                 )
                 st.rerun()
+
+        st.divider()
 
     st.session_state.selected_reports = selected_paths
 
