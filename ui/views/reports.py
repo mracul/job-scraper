@@ -86,15 +86,10 @@ def render_report_list():
     render_page_header(
         path=breadcrumbs,
         title="Reports",
-        subtitle="Browse and analyze your scraped job reports"
+        subtitle="Browse scrape runs. Select to view or compile results"
     )
 
-    # Header row with placeholders for compile/delete buttons (rendered after checkbox loop)
-    header_col, compile_col, delete_col = st.columns([3, 1, 1])
-    with header_col:
-        st.header("📂 Reports")
-    compile_placeholder = compile_col.empty()
-    delete_placeholder = delete_col.empty()
+    action_bar_placeholder = st.empty()
 
     if not runs:
         st.info("No reports found. Start a new scraping run to generate reports.")
@@ -102,204 +97,135 @@ def render_report_list():
             navigate_to("new_run")
         return
 
+    st.session_state.setdefault("selected_reports", [])
     selected_paths: list[str] = []
 
     for run in runs:
-        col0, col1, col2, col3 = st.columns([0.6, 3, 1, 1])
+        with st.container(border=True):
+            col0, col1, col2, col3 = st.columns([0.6, 3, 1, 1])
 
-        with col0:
-            checked = st.checkbox(
-                f"Select report: {run['name']}",
-                value=(str(run["path"]) in st.session_state.selected_reports),
-                key=f"sel_{run['name']}",
-                label_visibility="hidden"
-            )
-            if checked:
-                selected_paths.append(str(run["path"]))
-
-        with col1:
-            # Build display label
-            if run["keywords"] and run["keywords"] != "Not specified":
-                label = f"**{run['keywords']}**"
-                if run["location"] and run["location"] != "Not specified":
-                    label += f" — {run['location']}"
-            else:
-                label = f"**{run['name']}**"
-
-            st.markdown(label)
-
-            # Metadata line
-            meta_parts = []
-            if run["job_count"]:
-                meta_parts.append(f"{run['job_count']} jobs")
-            if run["timestamp"]:
-                meta_parts.append(run["timestamp"].strftime("%m/%d %H:%M"))
-            if run["has_analysis"]:
-                meta_parts.append("✅")
-            else:
-                meta_parts.append("❌")
-
-            st.caption(" • ".join(meta_parts))
-        with col2:
-            if st.button("View", key=f"view_{run['name']}", use_container_width=True):
-                navigate_to(
-                    "reports",
-                    selected_run=str(run["path"]),
-                    view_mode="overview",
-                    viewing_job_id=None,
-                    selected_filters={},
-                    filter_mode="any",
-                    search_text=""
+            with col0:
+                checked = st.checkbox(
+                    f"Select report: {run['name']}",
+                    value=(str(run["path"]) in st.session_state.selected_reports),
+                    key=f"sel_{run['name']}",
+                    label_visibility="hidden"
                 )
-                st.rerun()
+                if checked:
+                    selected_paths.append(str(run["path"]))
 
-        with col3:
-            if st.button("Explore", key=f"explore_{run['name']}", use_container_width=True):
-                navigate_to(
-                    "reports",
-                    selected_run=str(run["path"]),
-                    view_mode="explorer",
-                    viewing_job_id=None,
-                    selected_filters={},
-                    filter_mode="any",
-                    search_text=""
-                )
-                st.rerun()
+            with col1:
+                if run["keywords"] and run["keywords"] != "Not specified":
+                    label = f"**{run['keywords']}**"
+                    if run["location"] and run["location"] != "Not specified":
+                        label += f" — {run['location']}"
+                else:
+                    label = f"**{run['name']}**"
 
-        st.divider()
+                st.markdown(label)
+
+                meta_parts = []
+                if run["job_count"]:
+                    meta_parts.append(f"{run['job_count']} jobs")
+                if run["timestamp"]:
+                    meta_parts.append(run["timestamp"].strftime("%m/%d %H:%M"))
+                meta_parts.append("✅" if run["has_analysis"] else "❌")
+
+                st.caption(" • ".join(meta_parts))
+
+            with col2:
+                if st.button("View", key=f"view_{run['name']}", use_container_width=True):
+                    navigate_to(
+                        "reports",
+                        selected_run=str(run["path"]),
+                        view_mode="overview",
+                        viewing_job_id=None,
+                        selected_filters={},
+                        filter_mode="any",
+                        search_text="",
+                    )
+                    st.rerun()
+
+            with col3:
+                if st.button("Explore", key=f"explore_{run['name']}", use_container_width=True):
+                    navigate_to(
+                        "reports",
+                        selected_run=str(run["path"]),
+                        view_mode="explorer",
+                        viewing_job_id=None,
+                        selected_filters={},
+                        filter_mode="any",
+                        search_text="",
+                    )
+                    st.rerun()
 
     st.session_state.selected_reports = selected_paths
 
-    # Render compile/delete buttons now that selection is determined
-    compile_label = "🧩 Compile" if not selected_paths else f"🧩 Compile ({len(selected_paths)})"
-    compile_disabled = len(selected_paths) == 0
-    with compile_placeholder:
-        if st.button(
-            compile_label,
-            key="compile_button",
-            use_container_width=True,
-            type="primary",
-            disabled=compile_disabled,
-        ):
-            # Detect whether a matching compiled report already exists for this exact selection.
-            # This avoids unnecessary compilation work and lets the compiled page show a clear notice.
-            try:
-                run_paths = [Path(p) for p in selected_paths]
-                run_names = [p.name for p in run_paths]
-                fingerprint = build_runs_fingerprint(run_paths)
-                report_path = compiled_report_path(STATE_DIR, run_names=run_names)
-                cached_report = load_compiled_report(report_path)
-                st.session_state.compiled_preexisting = bool(
-                    cached_report
-                    and is_matching_compiled_report(cached_report, run_names=run_names, fingerprint=fingerprint)
-                )
-            except Exception:
-                st.session_state.compiled_preexisting = False
-            navigate_to(
-                "reports",
-                selected_run=None,
-                view_mode="compiled_overview",
-                viewing_job_id=None,
-                compiled_runs=list(selected_paths),
-            )
-            st.rerun()
-    delete_disabled = len(selected_paths) == 0
-    with delete_placeholder:
-        if st.button(
-            "🗑️ Delete",
-            key="multi_delete_button",
-            use_container_width=True,
-            disabled=delete_disabled,
-        ):
-            st.session_state.delete_candidates = list(selected_paths)
-            st.session_state.delete_modal_open = True
-            st.rerun()
+    compile_label = "Compile" if not selected_paths else f"Compile ({len(selected_paths)})"
+    actions = [
+        {
+            "label": compile_label,
+            "on_click": lambda: _handle_compile(selected_paths),
+            "kind": "primary",
+            "disabled": len(selected_paths) == 0,
+            "help": "Select at least one report to compile",
+        },
+        {
+            "label": "Delete",
+            "on_click": lambda: _trigger_delete(selected_paths),
+            "kind": "secondary",
+            "disabled": len(selected_paths) == 0,
+        },
+        {
+            "label": "Clear selection",
+            "on_click": _clear_report_selection,
+            "kind": "secondary",
+            "disabled": len(selected_paths) == 0,
+        },
+    ]
+
+    with action_bar_placeholder.container():
+        render_action_bar(actions)
 
     st.caption("Tip: Use browser back/forward to move between views.")
 
-    # Confirmation dialog for deleting selected reports
-    if st.session_state.delete_modal_open:
-        def _perform_delete() -> list[str]:
-            deleted: list[str] = []
-            for run_path in st.session_state.delete_candidates:
-                path_obj = Path(run_path)
-                try:
-                    if path_obj.exists() and path_obj.is_dir():
-                        shutil.rmtree(path_obj)
-                        deleted.append(str(path_obj))
-                except Exception:
-                    pass
 
-            # Clear cache so list updates immediately
-            list_runs.clear()
-
-            st.session_state.selected_reports = [p for p in st.session_state.selected_reports if p not in deleted]
-            st.session_state.compiled_runs = [p for p in st.session_state.compiled_runs if p not in deleted]
-            return deleted
-
-        if hasattr(st, "dialog"):
-            @st.dialog("Confirm deletion")
-            def _delete_dialog():
-                st.warning("⚠️ **Confirm Deletion**")
-                st.write("This will permanently delete the selected report folders:")
-                for run_path in st.session_state.delete_candidates:
-                    st.write(f"• {Path(run_path).name}")
-
-                col_confirm, col_cancel = st.columns(2)
-                with col_confirm:
-                    if st.button("✓ Confirm Delete", type="primary", use_container_width=True, key="dlg_confirm_delete"):
-                        deleted = _perform_delete()
-                        if st.session_state.selected_run in deleted:
-                            navigate_to(
-                                "reports",
-                                selected_run=None,
-                                view_mode="overview",
-                                viewing_job_id=None,
-                                selected_filters={},
-                                filter_mode="any",
-                                search_text="",
-                            )
-                        st.session_state.delete_candidates = []
-                        st.session_state.delete_modal_open = False
-                        st.rerun()
-                with col_cancel:
-                    if st.button("✗ Cancel", use_container_width=True, key="dlg_cancel_delete"):
-                        st.session_state.delete_modal_open = False
-                        st.session_state.delete_candidates = []
-                        st.rerun()
-
-            _delete_dialog()
-        else:
-            st.markdown("---")
-            st.warning("⚠️ **Confirm Deletion**")
-            st.write("This will permanently delete the selected report folders:")
-            for run_path in st.session_state.delete_candidates:
-                st.write(f"• {Path(run_path).name}")
-            col_confirm, col_cancel, _ = st.columns([1, 1, 2])
-            with col_confirm:
-                if st.button("✓ Confirm Delete", type="primary", use_container_width=True):
-                    deleted = _perform_delete()
-                    if st.session_state.selected_run in deleted:
-                        navigate_to(
-                            "reports",
-                            selected_run=None,
-                            view_mode="overview",
-                            viewing_job_id=None,
-                            selected_filters={},
-                            filter_mode="any",
-                            search_text="",
-                        )
-                    st.session_state.delete_candidates = []
-                    st.session_state.delete_modal_open = False
-                    st.rerun()
-            with col_cancel:
-                if st.button("✗ Cancel", use_container_width=True):
-                    st.session_state.delete_modal_open = False
-                    st.session_state.delete_candidates = []
-                    st.rerun()
+def _handle_compile(selected_paths: list[str]) -> None:
+    if not selected_paths:
+        return
+    try:
+        run_paths = [Path(p) for p in selected_paths]
+        run_names = [p.name for p in run_paths]
+        fingerprint = build_runs_fingerprint(run_paths)
+        report_path = compiled_report_path(STATE_DIR, run_names=run_names)
+        cached_report = load_compiled_report(report_path)
+        st.session_state.compiled_preexisting = bool(
+            cached_report
+            and is_matching_compiled_report(cached_report, run_names=run_names, fingerprint=fingerprint)
+        )
+    except Exception:
+        st.session_state.compiled_preexisting = False
+    navigate_to(
+        "reports",
+        selected_run=None,
+        view_mode="compiled_overview",
+        viewing_job_id=None,
+        compiled_runs=list(selected_paths),
+    )
+    st.rerun()
 
 
-# TODO: Add render_report_overview and render_compiled_overview functions
+def _trigger_delete(selected_paths: list[str]) -> None:
+    if not selected_paths:
+        return
+    st.session_state.delete_candidates = list(selected_paths)
+    st.session_state.delete_modal_open = True
+    st.rerun()
+
+
+def _clear_report_selection() -> None:
+    st.session_state.selected_reports = []
+    st.rerun()
 
 def render_report_overview():
     """Placeholder for render_report_overview - to be implemented"""
