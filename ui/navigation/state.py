@@ -4,8 +4,13 @@ Centralized navigation state management for the job scraper app.
 Defines the canonical navigation state keys and provides state manipulation functions.
 """
 
-import streamlit as st
 from typing import Dict, Any, Set
+
+
+def _st():
+    import streamlit as st
+
+    return st
 
 # Canonical navigation state keys
 NAV_KEYS: Set[str] = {
@@ -22,11 +27,13 @@ NAV_KEYS: Set[str] = {
 
 def snapshot_state() -> Dict[str, Any]:
     """Return a snapshot of only the navigation state keys."""
+    st = _st()
     return {key: st.session_state.get(key) for key in NAV_KEYS}
 
 
 def apply_state(patch: Dict[str, Any]) -> None:
     """Apply a patch to session state, only for navigation keys."""
+    st = _st()
     for key, value in patch.items():
         if key in NAV_KEYS:
             st.session_state[key] = value
@@ -38,6 +45,7 @@ def normalize_state() -> None:
     Streamlit reruns + URL sync can leave stale combinations (e.g. job_detail with no
     job id). Normalizing prevents incorrect components rendering.
     """
+    st = _st()
     page = st.session_state.get("page") or "reports"
     st.session_state.page = page
 

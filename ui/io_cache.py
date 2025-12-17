@@ -1,7 +1,31 @@
+import importlib.util
 import json
 from pathlib import Path
-import pandas as pd
-import streamlit as st
+from typing import Any
+
+_streamlit_spec = importlib.util.find_spec("streamlit")
+if _streamlit_spec:
+    import streamlit as st
+else:  # pragma: no cover - lightweight fallback for non-Streamlit environments
+    class _DummyStreamlit:
+        def cache_data(self, func=None, **kwargs):  # type: ignore[override]
+            if func is None:
+                return lambda f: f
+            return func
+
+    st = _DummyStreamlit()
+
+_pandas_spec = importlib.util.find_spec("pandas")
+if _pandas_spec:
+    import pandas as pd
+else:  # pragma: no cover - lightweight fallback for environments without pandas
+    class _DummyPandas:
+        DataFrame = Any
+
+        def read_csv(self, *args: Any, **kwargs: Any):
+            raise ImportError("pandas is required for CSV loading")
+
+    pd = _DummyPandas()
 
 
 def _load_cached_ai_summary(cache_path: Path) -> dict | None:

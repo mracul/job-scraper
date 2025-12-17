@@ -11,8 +11,7 @@ from typing import List, Dict, Any
 
 # Import dependencies
 from ui.components.page_header import render_page_header
-from ui.components.run_list_table import render_run_list_table
-from ui.components.bulk_action_bar import render_bulk_action_bar
+from ui.components.run_list_table import render_run_list
 from ui.components.action_bar import render_action_bar
 from ai_summary_ui import render_ai_summary_block
 from ui_core import load_settings, list_runs
@@ -78,15 +77,14 @@ def render_reports_page():
 
 
 def render_report_list():
-    """Render the list of available reports."""
+    """Render the list of available reports with shared run/bundle renderer."""
     runs = list_runs()
 
-    # Canonical page layout: PageHeader, ActionBar (optional), content
     breadcrumbs = build_breadcrumbs(snapshot_state())
     render_page_header(
         path=breadcrumbs,
         title="Reports",
-        subtitle="Browse scrape runs. Select to view or compile results"
+        subtitle="Browse scrape runs. Select to view or compile results."
     )
 
     action_bar_placeholder = st.empty()
@@ -97,97 +95,215 @@ def render_report_list():
             navigate_to("new_run")
         return
 
-    st.session_state.setdefault("selected_reports", [])
-    selected_paths: list[str] = []
+    st.session_state.setdefault("reports_mode", "runs")
+    st.session_state.setdefault("selected_run_ids", [])
+    st.session_state.setdefault("selected_bundle_ids", [])
+    st.session_state.setdefault("expanded_bundle_ids", [])
 
-    for run in runs:
-        with st.container(border=True):
-            col0, col1, col2, col3 = st.columns([0.6, 3, 1, 1])
+    mode = st.radio("View", options=["runs", "bundles"], horizontal=True, key="reports_mode")
+    if mode == "runs":
+        st.session_state.selected_bundle_ids = []
+        st.session_state.expanded_bundle_ids = []
+    else:
+        st.session_state.selected_run_ids = []
 
-            with col0:
-                checked = st.checkbox(
-                    f"Select report: {run['name']}",
-                    value=(str(run["path"]) in st.session_state.selected_reports),
-                    key=f"sel_{run['name']}",
-                    label_visibility="hidden"
-                )
-                if checked:
-                    selected_paths.append(str(run["path"]))
+    search_query = st.text_input(
+        "Filter by run or bundle name",
+        placeholder="Search runs...",
+        label_visibility="collapsed",
+        key=f"reports_search_{mode}",
+    )
 
-            with col1:
-                if run["keywords"] and run["keywords"] != "Not specified":
-                    label = f"**{run['keywords']}**"
-                    if run["location"] and run["location"] != "Not specified":
-                        label += f" — {run['location']}"
-                else:
-                    label = f"**{run['name']}**"
+    if mode == "runs":
+        rows = _build_run_rows(runs, query=search_query)
+        child_lookup: dict[str, list[dict]] = {}
+        selection_key = "selected_run_ids"
+        expanded_ids: set[str] = set()
+    else:
+        rows, child_lookup = _build_bundle_rows(runs, query=search_query)
+        selection_key = "selected_bundle_ids"
+        expanded_ids = set(st.session_state.get("expanded_bundle_ids", []))
 
-                st.markdown(label)
+    selected_ids = set(st.session_state.get(selection_key, []))
 
-                meta_parts = []
-                if run["job_count"]:
-                    meta_parts.append(f"{run['job_count']} jobs")
-                if run["timestamp"]:
-                    meta_parts.append(run["timestamp"].strftime("%m/%d %H:%M"))
-                meta_parts.append("✅" if run["has_analysis"] else "❌")
+    selected_ids, expanded_ids = render_run_list(
+        rows,
+        mode=mode,
+        selected_ids=selected_ids,
+        expanded_ids=expanded_ids,
+        child_lookup=child_lookup,
+        selection_enabled=True,
+        on_open=_open_row,
+    )
 
-                st.caption(" • ".join(meta_parts))
+    st.session_state[selection_key] = list(selected_ids)
+    if mode == "bundles":
+        st.session_state.expanded_bundle_ids = list(expanded_ids)
 
-            with col2:
-                if st.button("View", key=f"view_{run['name']}", use_container_width=True):
-                    navigate_to(
-                        "reports",
-                        selected_run=str(run["path"]),
-                        view_mode="overview",
-                        viewing_job_id=None,
-                        selected_filters={},
-                        filter_mode="any",
-                        search_text="",
-                    )
-                    st.rerun()
+    selected_run_paths = _selection_targets(mode, selected_ids, child_lookup)
+    selection_count = len(selected_run_paths)
 
-            with col3:
-                if st.button("Explore", key=f"explore_{run['name']}", use_container_width=True):
-                    navigate_to(
-                        "reports",
-                        selected_run=str(run["path"]),
-                        view_mode="explorer",
-                        viewing_job_id=None,
-                        selected_filters={},
-                        filter_mode="any",
-                        search_text="",
-                    )
-                    st.rerun()
-
-    st.session_state.selected_reports = selected_paths
-
-    compile_label = "Compile" if not selected_paths else f"Compile ({len(selected_paths)})"
-    actions = [
-        {
-            "label": compile_label,
-            "on_click": lambda: _handle_compile(selected_paths),
-            "kind": "primary",
-            "disabled": len(selected_paths) == 0,
-            "help": "Select at least one report to compile",
-        },
-        {
-            "label": "Delete",
-            "on_click": lambda: _trigger_delete(selected_paths),
-            "kind": "secondary",
-            "disabled": len(selected_paths) == 0,
-        },
-        {
-            "label": "Clear selection",
-            "on_click": _clear_report_selection,
-            "kind": "secondary",
-            "disabled": len(selected_paths) == 0,
-        },
-    ]
+    compile_disabled = selection_count < 2
+    delete_disabled = selection_count == 0
 
     with action_bar_placeholder.container():
-        render_action_bar(actions)
+        render_action_bar(
+            actions=[
+                {
+                    "label": "Compile",
+                    "on_click": lambda: _handle_compile(selected_run_paths),
+                    "kind": "primary",
+                    "disabled": compile_disabled,
+                    "help": "Select 2+ runs to compile",
+                },
+                {
+                    "label": "Delete",
+                    "on_click": lambda: _trigger_delete(selected_run_paths),
+                    "kind": "secondary",
+                    "disabled": delete_disabled,
+                    "help": "Select runs to delete",
+                },
+                {
+                    "label": "Clear selection",
+                    "on_click": lambda: _clear_report_selection(mode),
+                    "kind": "secondary",
+                    "disabled": delete_disabled,
+                    "help": "No selection" if delete_disabled else "Clear selection",
+                },
+            ],
+            justify="start",
+            compact=True,
+        )
 
-    st.caption("Tip: Use browser back/forward to move between views.")
+    st.caption("Tip: Selection persists across reruns. Use Clear to reset.")
+
+
+def _open_row(row: dict) -> None:
+    """Handle row click based on row type."""
+    row_type = row.get("type", "run")
+    if row_type == "bundle":
+        bundle_id = str(row.get("id"))
+        expanded = set(st.session_state.get("expanded_bundle_ids", []))
+        expanded.add(bundle_id)
+        st.session_state.expanded_bundle_ids = list(expanded)
+        st.session_state[_expand_state_key("bundles", bundle_id)] = True
+        st.rerun()
+        return
+
+    run_path = row.get("path") or row.get("id")
+    if run_path:
+        navigate_to(
+            "reports",
+            selected_run=str(run_path),
+            view_mode="overview",
+            viewing_job_id=None,
+            selected_filters={},
+            filter_mode="any",
+            search_text="",
+        )
+
+
+def _selection_targets(mode: str, selected_ids: set[str], child_lookup: dict[str, list[dict]]) -> list[str]:
+    """Return concrete run paths for the current selection context."""
+    if mode == "runs":
+        return list(selected_ids)
+
+    run_paths: list[str] = []
+    for bundle_id in selected_ids:
+        for child in child_lookup.get(bundle_id, []):
+            path = child.get("path") or child.get("id")
+            if path:
+                run_paths.append(str(path))
+    # Deduplicate while preserving order
+    return list(dict.fromkeys(run_paths))
+
+
+def _build_run_rows(runs: list[dict], query: str | None = None) -> list[dict]:
+    rows: list[dict] = []
+    for run in runs:
+        name = run.get("display_name") or run.get("keywords") or run.get("name")
+        subtitle = None
+        if run.get("search_mode") == "bundle" and run.get("bundle_ids"):
+            subtitle = f"Bundle run • {', '.join(run['bundle_ids'])}"
+        elif run.get("location") and run.get("location") != "Not specified":
+            subtitle = run.get("location")
+
+        row = {
+            "id": str(run.get("path") or run.get("name")),
+            "path": str(run.get("path") or ""),
+            "name": name,
+            "subtitle": subtitle,
+            "job_count": run.get("job_count", 0) or 0,
+            "created": run.get("timestamp"),
+            "status": "generated" if run.get("has_analysis") else "dirty",
+            "status_text": "Analyzed" if run.get("has_analysis") else "Needs analysis",
+            "type": "run",
+        }
+        rows.append(row)
+
+    if query:
+        q = query.lower()
+        rows = [r for r in rows if q in (r.get("name") or "").lower() or q in (r.get("subtitle") or "").lower()]
+
+    rows.sort(key=lambda r: r.get("created") or datetime.min, reverse=True)
+    return rows
+
+
+def _build_bundle_rows(runs: list[dict], query: str | None = None) -> tuple[list[dict], dict[str, list[dict]]]:
+    bundles: dict[str, dict] = {}
+    for run in runs:
+        bundle_ids = run.get("bundle_ids") or []
+        if run.get("search_mode") != "bundle" or not bundle_ids:
+            continue
+
+        bundle_id = bundle_ids[0]
+        bucket = bundles.setdefault(
+            bundle_id,
+            {
+                "id": bundle_id,
+                "name": bundle_id,
+                "job_count": 0,
+                "created": None,
+                "runs": [],
+                "has_analysis": False,
+            },
+        )
+
+        bucket["runs"].append(run)
+        bucket["job_count"] += run.get("job_count", 0) or 0
+        bucket["has_analysis"] = bucket.get("has_analysis") or bool(run.get("has_analysis"))
+        ts = run.get("timestamp")
+        if ts and (bucket.get("created") is None or ts > bucket.get("created")):
+            bucket["created"] = ts
+
+    rows: list[dict] = []
+    child_lookup: dict[str, list[dict]] = {}
+    for bundle_id, data in bundles.items():
+        runs_for_bundle = _build_run_rows(data["runs"], query=None)
+        child_lookup[bundle_id] = runs_for_bundle
+        row = {
+            "id": bundle_id,
+            "name": bundle_id,
+            "subtitle": f"{len(runs_for_bundle)} run(s)",
+            "job_count": data.get("job_count", 0),
+            "created": data.get("created"),
+            "status": "generated" if data.get("has_analysis") else "dirty",
+            "status_text": "Has analysis" if data.get("has_analysis") else "Needs analysis",
+            "type": "bundle",
+        }
+        rows.append(row)
+
+    if query:
+        q = query.lower()
+        rows = [r for r in rows if q in (r.get("name") or "").lower() or q in (r.get("subtitle") or "").lower()]
+
+    rows.sort(key=lambda r: r.get("created") or datetime.min, reverse=True)
+    return rows, child_lookup
+
+
+def _expand_state_key(mode: str, row_id: str) -> str:
+    safe_id = row_id.replace("/", "_").replace("\\", "_")
+    return f"{mode}_expand_{safe_id}"
 
 
 def _handle_compile(selected_paths: list[str]) -> None:
@@ -223,8 +339,21 @@ def _trigger_delete(selected_paths: list[str]) -> None:
     st.rerun()
 
 
-def _clear_report_selection() -> None:
-    st.session_state.selected_reports = []
+def _clear_report_selection(mode: str) -> None:
+    """Clear selection state and associated widgets for the active mode."""
+    key_prefix = f"{mode}_select_"
+    for key in list(st.session_state.keys()):
+        if key.startswith(key_prefix):
+            st.session_state.pop(key)
+
+    if mode == "runs":
+        st.session_state.selected_run_ids = []
+    else:
+        st.session_state.selected_bundle_ids = []
+        st.session_state.expanded_bundle_ids = []
+        for key in list(st.session_state.keys()):
+            if key.startswith("bundles_expand_"):
+                st.session_state.pop(key)
     st.rerun()
 
 def render_report_overview():

@@ -4,22 +4,23 @@ URL synchronization for navigation state.
 Handles encoding/decoding navigation state to/from URL query parameters.
 """
 
-import streamlit as st
 import json
 from typing import Dict, Any, Optional
 from urllib.parse import parse_qs, urlencode
 
-from .state import NAV_KEYS, snapshot_state, apply_state
+from .state import NAV_KEYS, snapshot_state, apply_state, _st
 
 
 def _get_query_params() -> Dict[str, Any]:
     """Get current URL query parameters."""
+    st = _st()
     query_params = st.query_params
     return dict(query_params) if query_params else {}
 
 
 def _set_query_params(params: Dict[str, Any]) -> None:
     """Set URL query parameters."""
+    st = _st()
     # Clear existing params
     st.query_params.clear()
     # Set new params

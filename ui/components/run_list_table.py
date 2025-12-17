@@ -1,208 +1,227 @@
-import streamlit as st
-from typing import List, Dict, Any, Callable, Optional, Tuple
-import pandas as pd
+"""Shared renderer for run and bundle lists.
+
+This component renders compact, bordered rows with consistent columns for
+both run and bundle contexts. Selection is handled outside the component via
+the returned `selected_ids` set so views can drive selection-aware action
+bars. Bundle rows can optionally show their child runs inline while reusing
+the same row renderer for visual consistency.
+"""
+
+from __future__ import annotations
+
 from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+import streamlit as st
+
+from .status_badge import render_status_badge
+
+Row = Dict[str, Any]
 
 
-def render_run_list_table(
-    runs: List[Dict[str, Any]],
-    on_run_select: Callable[[str], None],
-    on_run_delete: Callable[[str], None],
-    on_bulk_compile: Callable[[List[str]], None],
-    on_bulk_delete: Callable[[List[str]], None],
-    selected_runs: Optional[List[str]] = None
-) -> Tuple[List[str], Optional[str]]:
-    """
-    Render a compact table for displaying runs with selection, search, and sorting.
+def render_run_list(
+    rows: List[Row],
+    *,
+    mode: str,
+    selected_ids: Iterable[str] | None = None,
+    expanded_ids: Iterable[str] | None = None,
+    child_lookup: Optional[Dict[str, List[Row]]] = None,
+    selection_enabled: bool = True,
+    on_open: Optional[callable] = None,
+) -> Tuple[Set[str], Set[str]]:
+    """Render a list of runs or bundles with shared styling.
 
     Args:
-        runs: List of run dictionaries with keys: id, title, job_count, timestamp, status
-        on_run_select: Callback when a run is selected/opened
-        on_run_delete: Callback when a run is deleted
-        on_bulk_compile: Callback for bulk compile action
-        on_bulk_delete: Callback for bulk delete action
-        selected_runs: Currently selected run IDs
+        rows: Items to render. Each row should include id, name, job_count,
+            created (datetime | str | None), and status (str).
+        mode: "runs" or "bundles" (used for key scoping).
+        selected_ids: Optional iterable of ids that should start selected.
+        expanded_ids: Optional iterable of bundle ids that should start expanded.
+        child_lookup: Optional mapping of bundle_id -> list of child run rows.
+        selection_enabled: Whether checkboxes should be interactive.
+        on_open: Optional callback accepting a row dict when its name is clicked.
 
     Returns:
-        Tuple of (selected_run_ids, search_query)
+        A tuple of (selected_ids, expanded_ids) after handling widget state.
     """
 
-    if selected_runs is None:
-        selected_runs = []
+    selected_ids = set(selected_ids or [])
+    expanded_ids = set(expanded_ids or [])
+    child_lookup = child_lookup or {}
 
-    # Search and sort controls
-    search_query = _render_search_and_sort_controls()
-
-    # Filter runs based on search
-    filtered_runs = _filter_runs(runs, search_query)
-
-    # Selection state management
-    all_selected = len(selected_runs) == len(filtered_runs) and len(filtered_runs) > 0
-    some_selected = len(selected_runs) > 0
-
-    # Header with select all checkbox
-    col_check, col_title, col_jobs, col_timestamp, col_status, col_actions = st.columns([0.5, 3, 1, 1.5, 1, 0.8])
-
-    with col_check:
-        select_all = st.checkbox(
-            "",
-            value=all_selected,
-            key="select_all_runs",
-            help="Select all visible runs"
-        )
-
-        # Update selection based on select all
-        if select_all and not all_selected:
-            selected_runs = [run['id'] for run in filtered_runs]
-        elif not select_all and all_selected:
-            selected_runs = []
-
-    with col_title:
-        st.markdown("**Title**")
-    with col_jobs:
-        st.markdown("**Jobs**")
-    with col_timestamp:
-        st.markdown("**Created**")
-    with col_status:
-        st.markdown("**Status**")
-    with col_actions:
-        st.markdown("**Actions**")
-
+    header_cols = st.columns([0.5, 3.0, 1.0, 1.4, 1.0, 0.9])
+    if selection_enabled:
+        header_cols[0].markdown("**Select**")
+    else:
+        header_cols[0].markdown("\u00a0")
+    header_cols[1].markdown("**Name**")
+    header_cols[2].markdown("**Jobs**")
+    header_cols[3].markdown("**Created**")
+    header_cols[4].markdown("**Status**")
+    header_cols[5].markdown("**Actions**")
     st.divider()
 
-    # Render run rows
-    for run in filtered_runs:
-        run_id = run['id']
-        is_selected = run_id in selected_runs
+    checkbox_keys: dict[str, str] = {}
+    expand_keys: dict[str, str] = {}
 
-        cols = st.columns([0.5, 3, 1, 1.5, 1, 0.8])
+    for row in rows:
+        row_id = str(row.get("id"))
+        is_selected = row_id in selected_ids
+        is_expanded = row_id in expanded_ids
+        has_children = bool(child_lookup.get(row_id))
 
-        # Checkbox
-        with cols[0]:
-            if st.checkbox("", value=is_selected, key=f"select_{run_id}"):
-                if run_id not in selected_runs:
-                    selected_runs.append(run_id)
-            else:
-                if run_id in selected_runs:
-                    selected_runs.remove(run_id)
+        checkbox_keys[row_id] = _checkbox_key(mode, row_id)
+        expand_keys[row_id] = _expand_key(mode, row_id)
 
-        # Title (clickable)
-        with cols[1]:
-            title = run.get('title', f'Run {run_id}')
-            if st.button(title, key=f"open_{run_id}", help="Open run details"):
-                on_run_select(run_id)
+        _render_row(
+            row,
+            mode=mode,
+            selected=is_selected,
+            expanded=is_expanded,
+            has_children=has_children,
+            selection_enabled=selection_enabled,
+            on_open=on_open,
+        )
 
-        # Job count
-        with cols[2]:
-            job_count = run.get('job_count', 0)
-            st.markdown(f"{job_count}")
-
-        # Timestamp
-        with cols[3]:
-            timestamp = run.get('timestamp')
-            if timestamp:
-                if isinstance(timestamp, str):
-                    try:
-                        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                        display_time = dt.strftime("%b %d, %H:%M")
-                    except:
-                        display_time = timestamp[:16]  # Fallback
-                else:
-                    display_time = timestamp.strftime("%b %d, %H:%M")
-                st.markdown(display_time)
-            else:
-                st.markdown("—")
-
-        # Status
-        with cols[4]:
-            status = run.get('status', 'unknown')
-            _render_status_in_table(status)
-
-        # Actions menu
-        with cols[5]:
-            _render_run_actions_menu(run_id, on_run_delete)
+        if is_expanded and has_children:
+            with st.container(border=True):
+                st.caption("Runs in bundle")
+                child_rows = child_lookup[row_id]
+                _render_child_rows(
+                    child_rows,
+                    mode=mode,
+                    selected_ids=selected_ids,
+                    selection_enabled=False,
+                    on_open=on_open,
+                )
 
         st.divider()
 
-    # Bulk actions bar
-    if selected_runs:
-        from .bulk_action_bar import render_bulk_action_bar
+    # Recompute selection from widget state to keep persistence on rerun
+    updated_selected: Set[str] = set()
+    for row_id in checkbox_keys:
+        key = checkbox_keys[row_id]
+        if st.session_state.get(key, False):
+            updated_selected.add(row_id)
 
-        actions = [
-            {
-                'label': 'Compile',
-                'on_click': lambda: on_bulk_compile(selected_runs),
-                'kind': 'primary'
-            },
-            {
-                'label': 'Delete',
-                'on_click': lambda: on_bulk_delete(selected_runs),
-                'kind': 'danger'
-            }
-        ]
+    updated_expanded: Set[str] = set()
+    for row_id in expand_keys:
+        if st.session_state.get(expand_keys[row_id], False):
+            updated_expanded.add(row_id)
 
-        render_bulk_action_bar(
-            selection_count=len(selected_runs),
-            actions=actions,
-            on_clear=lambda: selected_runs.clear()
+    return updated_selected, updated_expanded
+
+
+def _render_row(
+    row: Row,
+    *,
+    mode: str,
+    selected: bool,
+    expanded: bool,
+    has_children: bool,
+    selection_enabled: bool,
+    on_open: Optional[callable],
+) -> None:
+    caret = "▾" if expanded else "▸"
+    created_label = _format_created(row.get("created"))
+    job_count = row.get("job_count") or 0
+
+    cols = st.columns([0.5, 3.0, 1.0, 1.4, 1.0, 0.9])
+
+    with cols[0]:
+        inner = st.columns([0.5, 0.5])
+        with inner[0]:
+            if has_children:
+                st.toggle(
+                    caret,
+                    key=_expand_key(mode, str(row.get("id"))),
+                    label_visibility="collapsed",
+                    value=expanded,
+                    disabled=not has_children,
+                    help="Show runs in this bundle" if has_children else None,
+                )
+            else:
+                st.markdown("\u00a0")
+        with inner[1]:
+            st.checkbox(
+                "",
+                key=_checkbox_key(mode, str(row.get("id"))),
+                value=selected,
+                disabled=not selection_enabled,
+                label_visibility="collapsed",
+                help="Select to compile or delete",
+            )
+
+    with cols[1]:
+        label = row.get("name", "Run")
+        subtitle = row.get("subtitle")
+        if st.button(
+            label,
+            key=f"open_{mode}_{row.get('id')}",
+            help="Open details",
+        ):
+            if on_open:
+                on_open(row)
+        if subtitle:
+            st.caption(subtitle)
+
+    cols[2].markdown(f"{job_count}")
+    cols[3].markdown(created_label)
+
+    with cols[4]:
+        status = row.get("status") or ""
+        status_text = row.get("status_text")
+        render_status_badge(status or "generated", text=status_text or status)
+
+    with cols[5]:
+        action_help = row.get("action_help", "Open")
+        if st.button("🔍", key=f"action_{mode}_{row.get('id')}", help=action_help):
+            if on_open:
+                on_open(row)
+
+
+def _render_child_rows(
+    child_rows: List[Row],
+    *,
+    mode: str,
+    selected_ids: Set[str],
+    selection_enabled: bool,
+    on_open: Optional[callable],
+) -> None:
+    for child in child_rows:
+        _render_row(
+            child,
+            mode=f"{mode}_child",
+            selected=str(child.get("id")) in selected_ids,
+            expanded=False,
+            has_children=False,
+            selection_enabled=selection_enabled,
+            on_open=on_open,
         )
 
-    return selected_runs, search_query
+
+def _format_created(created: Any) -> str:
+    if isinstance(created, datetime):
+        return created.strftime("%b %d, %H:%M")
+    if isinstance(created, str) and created:
+        try:
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            return dt.strftime("%b %d, %H:%M")
+        except Exception:
+            return created[:16]
+    return "—"
 
 
-def _render_search_and_sort_controls() -> str:
-    """Render search input and sort dropdown."""
-    col1, col2 = st.columns([3, 1])
-
-    with col1:
-        search_query = st.text_input(
-            "Search runs...",
-            placeholder="Filter by title",
-            label_visibility="collapsed",
-            key="run_search"
-        )
-
-    with col2:
-        sort_options = ["Newest", "Oldest", "Most Jobs", "Least Jobs", "Name A-Z", "Name Z-A"]
-        st.selectbox(
-            "Sort by",
-            options=sort_options,
-            index=0,
-            label_visibility="collapsed",
-            key="run_sort"
-        )
-
-    return search_query
+def _checkbox_key(mode: str, row_id: str) -> str:
+    safe_id = _safe_key_fragment(row_id)
+    return f"{mode}_select_{safe_id}"
 
 
-def _filter_runs(runs: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
-    """Filter runs based on search query."""
-    if not query:
-        return runs
-
-    query_lower = query.lower()
-    return [
-        run for run in runs
-        if query_lower in run.get('title', '').lower() or
-           query_lower in str(run.get('id', '')).lower()
-    ]
+def _expand_key(mode: str, row_id: str) -> str:
+    safe_id = _safe_key_fragment(row_id)
+    return f"{mode}_expand_{safe_id}"
 
 
-def _render_status_in_table(status: str) -> None:
-    """Render status badge in table cell."""
-    from .status_badge import render_status_badge
+def _safe_key_fragment(value: str) -> str:
+    return value.replace("/", "_").replace("\\", "_")
 
-    # Use compact inline variant for table
-    render_status_badge(status, size='sm', variant='inline')
-
-
-def _render_run_actions_menu(run_id: str, on_delete: Callable[[str], None]) -> None:
-    """Render actions menu for a run row."""
-    with st.popover("⋯"):
-        if st.button("View Details", key=f"view_{run_id}"):
-            st.rerun()  # This would trigger the select callback
-
-        st.divider()
-
-        if st.button("Delete", key=f"delete_{run_id}", type="secondary"):
-            on_delete(run_id)
