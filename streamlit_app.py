@@ -2255,7 +2255,10 @@ def render_compiled_overview():
         if not data:
             continue
 
-        with st.expander(f"{category_label} ({len(data)} items)", expanded=False):
+        # Keep expander expanded if there's an active selection in this category
+        has_selection = bool(st.session_state.get(f"compiled_selected_term_{category_key}"))
+        
+        with st.expander(f"{category_label} ({len(data)} items)", expanded=has_selection):
             sorted_items_full = sorted(data.items(), key=lambda x: x[1], reverse=True)
             sorted_items = sorted_items_full[:15]
             df = pd.DataFrame(
@@ -2574,7 +2577,10 @@ def render_report_overview():
         if not data:
             continue
         
-        with st.expander(f"{category_label} ({len(data)} items)", expanded=False):
+        # Keep expander expanded if there's an active selection in this category
+        has_selection = bool(st.session_state.get(f"report_selected_term_{category_key}"))
+        
+        with st.expander(f"{category_label} ({len(data)} items)", expanded=has_selection):
             # Prepare data for chart
             sorted_items_full = sorted(data.items(), key=lambda x: x[1], reverse=True)
             sorted_items = sorted_items_full[:15]  # Top 15
