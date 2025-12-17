@@ -1919,7 +1919,7 @@ def render_report_list():
     selected_paths: list[str] = []
 
     for run in runs:
-        col0, col1, col2, col3 = st.columns([0.6, 3.2, 1, 1])
+        col0, col1, col2, col3 = st.columns([0.5, 2.5, 1.2, 1.2])
 
         with col0:
             checked = st.checkbox(
@@ -1934,28 +1934,35 @@ def render_report_list():
         with col1:
             # Build compact display label
             if run["keywords"] and run["keywords"] != "Not specified":
-                label = f"**{run['keywords']}**"
+                # Truncate long keywords for narrow screens
+                keywords = run["keywords"]
+                if len(keywords) > 30:
+                    keywords = keywords[:27] + "..."
+                label = f"**{keywords}**"
                 if run["location"] and run["location"] != "Not specified":
-                    label += f" — {run['location']}"
+                    location = run["location"]
+                    if len(location) > 15:
+                        location = location[:12] + "..."
+                    label += f" — {location}"
             else:
                 label = f"**{run['name']}**"
             
             st.markdown(label)
             
-            # Metadata line
+            # Compact single-line metadata
             meta_parts = []
             if run["job_count"]:
-                meta_parts.append(f"{run['job_count']} jobs")
+                meta_parts.append(f"{run['job_count']}")
             if run["timestamp"]:
-                meta_parts.append(run["timestamp"].strftime("%Y-%m-%d %H:%M"))
+                meta_parts.append(run["timestamp"].strftime("%m/%d"))
             if run["has_analysis"]:
-                meta_parts.append("✅ Analyzed")
+                meta_parts.append("✓")
             else:
-                meta_parts.append("⚠️ No analysis")
+                meta_parts.append("⚠")
             
-            st.caption(" • ".join(meta_parts))
+            st.caption(" • ".join(meta_parts), help=f"{run['job_count']} jobs • {run['timestamp'].strftime('%Y-%m-%d %H:%M')} • {'Analyzed' if run['has_analysis'] else 'No analysis'}")
         with col2:
-            if st.button("View", key=f"view_{run['name']}", use_container_width=True):
+            if st.button("View", key=f"view_{run['name']}", use_container_width=True, help="View report overview"):
                 navigate_to(
                     "reports",
                     selected_run=str(run["path"]),
@@ -1968,7 +1975,7 @@ def render_report_list():
                 st.rerun()
         
         with col3:
-            if st.button("Explore", key=f"explore_{run['name']}", use_container_width=True):
+            if st.button("Explore", key=f"explore_{run['name']}", use_container_width=True, help="Explore job details"):
                 navigate_to(
                     "reports",
                     selected_run=str(run["path"]),
