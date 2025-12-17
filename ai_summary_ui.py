@@ -1,3 +1,21 @@
+from pathlib import Path
+import time
+import streamlit as st
+from markdown import markdown as md_to_html
+
+from ai_summary_core import (
+    AI_SUMMARY_SYSTEM_PROMPT,
+    AI_SUMMARY_MAX_OUTPUT_TOKENS,
+    _load_cached_ai_summary,
+    _save_cached_ai_summary,
+    compute_input_hash,
+    resolve_cache_state,
+)
+
+# UI-only constants
+AI_MAX_N = 50
+AI_MAX_COMPILED_N = 75
+
 # --- AI Summary UI Block ---
 def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate: bool = True) -> None:
     import hashlib, re
@@ -289,119 +307,3 @@ div.stButton > button {
             st.markdown("_No summary yet._")
 
     st.markdown("</div>", unsafe_allow_html=True)
-from pathlib import Path
-import time
-import streamlit as st
-from markdown import markdown as md_to_html
-
-from ai_summary_core import (
-    AI_SUMMARY_SYSTEM_PROMPT,
-    AI_SUMMARY_MAX_OUTPUT_TOKENS,
-    _load_cached_ai_summary,
-    _save_cached_ai_summary,
-    compute_input_hash,
-    resolve_cache_state,
-)
-
-# UI-only constants
-AI_MAX_N = 50
-AI_MAX_COMPILED_N = 75
-
-
-def _fallback_summary_from_input(ai_input: dict) -> str:
-    """Simple fallback when AI generation fails - just show error message."""
-    total_jobs = ai_input.get("total_jobs", 0)
-    return (
-        f"⚠️ **AI summary generation failed.** Unable to analyze {total_jobs} job listings.\n\n"
-        "Please check your OpenAI API key in Settings or try again later."
-    )
-
-def _generate_ai_summary_text(ai_input: dict) -> str:
-    import requests, time
-    from .streamlit_app import load_settings, _stable_json_dumps
-    api_key = None
-    try:
-        from .streamlit_app import _get_openai_api_key
-        api_key = _get_openai_api_key()
-    except Exception:
-        pass
-    if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY. Add it to .streamlit/secrets.toml or env var.")
-
-    settings = load_settings()
-    ai_model = settings.get("ai", {}).get("model", "gpt-5-mini")
-
-    # Prefer sending the human-readable analysis text (requirements_analysis.txt) plus metadata.
-    # Backward-compatibility: some callers still pass structured JSON (categories/top terms).
-    if isinstance(ai_input, dict) and isinstance(ai_input.get("analysis_text"), str):
-        meta = ai_input.get("meta")
-        user_prompt = (
-            "Here is a job requirements analysis report for the user's search. "
-            "Use ONLY the report text and the metadata block to produce the requested summary.\n\n"
-            f"METADATA_JSON={_stable_json_dumps(meta if isinstance(meta, dict) else {})}\n\n"
-            f"REQUIREMENTS_ANALYSIS_TXT=\n{ai_input.get('analysis_text','').strip()}"
-        )
-    else:
-        user_prompt = (
-            "Here is aggregated job-requirement data (counts and consolidated percentages) for the user's search. "
-            "Use it to produce the requested summary.\n\n"
-            f"DATA_JSON={_stable_json_dumps(ai_input)}"
-        )
-
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": ai_model,
-        "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": AI_SUMMARY_SYSTEM_PROMPT}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-        ],
-        "max_output_tokens": AI_SUMMARY_MAX_OUTPUT_TOKENS,
-    }
-
-    url = "https://api.openai.com/v1/responses"
-    backoff_seconds = 1.0
-    resp = None
-    last_error = None
-    for attempt in range(3):
-        try:
-            resp = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=120,
-            )
-        except requests.RequestException as exc:
-            last_error = exc
-            if attempt < 2:
-                time.sleep(backoff_seconds)
-                backoff_seconds *= 2
-                continue
-            raise RuntimeError(f"OpenAI request failed: {exc}")
-
-        if resp.status_code in {429, 500, 502, 503, 504} and attempt < 2:
-            time.sleep(backoff_seconds)
-            backoff_seconds *= 2
-            continue
-
-        if resp.status_code >= 400:
-            raise RuntimeError(f"OpenAI API error ({resp.status_code}): {resp.text[:400]}")
-        break
-
-    if resp is None:
-        raise RuntimeError(f"OpenAI request failed: {last_error}")
-
-    try:
-        data = resp.json()
-    except Exception as exc:
-        raise RuntimeError(f"OpenAI API returned non-JSON response: {str(exc)[:200]}")
-    parts = []
-    for out in data.get("output", []) or []:
-        for content in out.get("content", []) or []:
-            if content.get("type") == "output_text" and content.get("text"):
-                parts.append(content.get("text"))
-    text = "".join(parts).strip()
-    if not text:
-        text = (data.get("output_text") or "").strip()
-    if not text:
-        text = _fallback_summary_from_input(ai_input)
-    return text
