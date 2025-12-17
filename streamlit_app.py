@@ -149,20 +149,42 @@ def _hash_payload(payload) -> str:
 
 
 def _load_cached_ai_summary(cache_path: Path) -> dict | None:
+    """Load cached AI summary with robust error handling."""
     if not cache_path.exists():
         return None
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else None
-    except Exception:
+        # Validate that it's a dict with required fields
+        if isinstance(data, dict) and "summary" in data and "input_hash" in data:
+            return data
+        return None
+    except (json.JSONDecodeError, IOError, OSError):
+        # If file is corrupted, remove it so it can be regenerated
+        try:
+            cache_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         return None
 
 
 def _save_cached_ai_summary(cache_path: Path, data: dict) -> None:
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    """Save cached AI summary with robust error handling."""
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # Write to a temporary file first, then rename for atomicity
+        temp_path = cache_path.with_suffix(".tmp")
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        temp_path.replace(cache_path)
+    except Exception:
+        # If saving fails, try the old method
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass  # Silently fail if caching is not possible
 
 
 def _get_run_search_meta(run_path: Path) -> tuple[str | None, str | None]:
@@ -392,9 +414,16 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
     cached = _load_cached_ai_summary(cache_path)
     input_hash = _hash_payload(cache_basis)
     cached_text = None
-    if cached and cached.get("input_hash") == input_hash:
-        cached_text = cached.get("summary")
-
+    cache_status = None
+    if cached:
+        if cached.get("input_hash") == input_hash:
+            cached_text = cached.get("summary")
+            cache_status = "current"
+        elif cached.get("summary"):
+            # Fallback: use cached summary even if parameters changed, but mark as potentially outdated
+            cached_text = cached.get("summary")
+            cache_status = "outdated"
+    
     auto_key = f"ai_auto_{cache_path.name}_{input_hash[:8]}"
     inflight_key = f"ai_inflight_{cache_path.name}_{input_hash[:8]}"
     inflight_started_key = f"ai_inflight_started_{cache_path.name}_{input_hash[:8]}"
@@ -411,7 +440,7 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
     except Exception:
         pass
 
-    if auto_generate and (not summary_text) and (not st.session_state.get(auto_key)):
+    if auto_generate and (not cached_text) and (not st.session_state.get(auto_key)):
         st.session_state[auto_key] = True
         st.session_state[inflight_key] = True
         st.session_state[inflight_started_key] = time.time()
@@ -442,6 +471,15 @@ def _render_ai_summary_block(*, cache_path: Path, ai_input: dict, auto_generate:
     if summary_text:
         # Fixed-size, scrollable view (safe Markdown rendering)
         # Avoid unsafe HTML injection: render markdown within a height-limited container.
+        cache_indicator = ""
+        if cache_status == "outdated":
+            cache_indicator = " ⚠️ *Summary may be outdated due to parameter changes*"
+        elif cache_status == "current":
+            cache_indicator = " ✅ *Using cached summary*"
+        
+        if cache_indicator:
+            st.caption(cache_indicator)
+        
         try:
             with st.container(height=260, border=True):
                 st.markdown(summary_text)
@@ -1039,7 +1077,7 @@ def _build_overview_payload(*, runs: list[dict], cutoff_days: int, half_life_day
         if not analysis:
             continue
         total_jobs = int(analysis.get("total_jobs", 0) or 0)
-        summary = analysis.get("summary", {}) or {}
+        summary = analysis.get("summary", {}) or analysis.get("presence", {}) or {}
         if not isinstance(summary, dict) or (not summary):
             continue
         run_ts = r.get("timestamp")
@@ -1143,7 +1181,7 @@ def _build_overview_payload(*, runs: list[dict], cutoff_days: int, half_life_day
         run_path = Path(r["path"])
         analysis = load_analysis(run_path) or {}
         total_jobs = int(analysis.get("total_jobs", 0) or 0)
-        summary = analysis.get("summary", {}) or {}
+        summary = analysis.get("summary", {}) or analysis.get("presence", {}) or {}
         run_ts_str = r.get("timestamp")
         run_label = r["name"]
         run_order = idx
@@ -1885,7 +1923,12 @@ def render_report_list():
             col0, col1, col2, col3 = st.columns([0.6, 3, 1, 1])
 
             with col0:
-                checked = st.checkbox("", value=(str(run["path"]) in st.session_state.selected_reports), key=f"sel_{run['name']}")
+                checked = st.checkbox(
+                    f"Select report: {run['name']}",
+                    value=(str(run["path"]) in st.session_state.selected_reports),
+                    key=f"sel_{run['name']}",
+                    label_visibility="hidden"
+                )
                 if checked:
                     selected_paths.append(str(run["path"]))
             
@@ -2130,7 +2173,7 @@ def render_compiled_overview():
     for run_path, analysis in analyses:
         if not analysis:
             continue
-        for cat_key, items in (analysis.get("summary", {}) or {}).items():
+        for cat_key, items in (analysis.get("summary", {}) or analysis.get("presence", {}) or {}).items():
             for term, count in (items or {}).items():
                 try:
                     run_term_index[cat_key][term].append((int(count), run_path))
@@ -2440,7 +2483,7 @@ def render_report_overview():
         st.warning("No analysis data found for this report. Run analysis first.")
         return
     
-    summary = analysis.get("summary", {})
+    summary = analysis.get("summary", {}) or analysis.get("presence", {})
     total_jobs = analysis.get("total_jobs", 0)
     
     # Summary cards
@@ -2707,77 +2750,46 @@ def render_job_explorer():
         st.warning("Missing data for job exploration.")
         return
 
-    parsed_dates = (
-        pd.to_datetime(jobs_df["date_posted"], errors="coerce")
-        if "date_posted" in jobs_df.columns
-        else pd.Series([pd.NaT] * len(jobs_df))
-    )
-    job_dates = {idx + 1: parsed_dates.iloc[idx] for idx in range(len(parsed_dates))}
+    # Calculate posting dates for sorting
+    posting_dates = {}
+    for idx in range(len(jobs_df)):
+        job_row = jobs_df.iloc[idx]
+        date_value = job_row.get("date_posted")
+        if pd.notna(date_value) and date_value:
+            try:
+                # Extract scraping date from folder name (format: ..._YYYYMMDD_HHMMSS)
+                folder_name = run_path.name
+                date_match = re.search(r'_(\d{8})_', folder_name)
+                if date_match:
+                    scrape_date_str = date_match.group(1)
+                    scrape_date = datetime.strptime(scrape_date_str, "%Y%m%d")
+                    
+                    # Parse date_posted (e.g., "2d ago", "1w ago")
+                    days_ago = 0
+                    if "d ago" in date_value:
+                        days_ago = int(re.search(r'(\d+)d ago', date_value).group(1))
+                    elif "w ago" in date_value:
+                        days_ago = int(re.search(r'(\d+)w ago', date_value).group(1)) * 7
+                    elif "h ago" in date_value:
+                        hours_ago = int(re.search(r'(\d+)h ago', date_value).group(1))
+                        days_ago = hours_ago // 24
+                    
+                    posting_date = scrape_date - pd.Timedelta(days=days_ago)
+                    posting_dates[idx + 1] = posting_date  # job_id is 1-indexed
+            except (ValueError, AttributeError):
+                pass
     
-    job_details = {j["id"]: j for j in analysis.get("job_details", [])}
-    summary = analysis.get("summary", {})
+    # Sort jobs by most recent date (newest first)
+    reverse_sort = True
     
-    # Filters in sidebar (more room for results)
-    with st.sidebar:
-        with st.expander("Filters", expanded=True):
-            filter_mode = st.radio(
-                "Match mode",
-                ["any", "all"],
-                format_func=lambda x: "Match ANY tag" if x == "any" else "Match ALL tags",
-                horizontal=False,
-                key="filter_mode_radio",
-            )
-            st.session_state.filter_mode = filter_mode
-
-            search_text = st.text_input("🔎 Search title/company", key="search_text")
-
-            sort_options = ["Newest first", "Oldest first"]
-            default_sort_label = "Newest first" if st.session_state.get("job_sort_order", "newest") == "newest" else "Oldest first"
-            sort_label = st.selectbox(
-                "Sort jobs by date",
-                sort_options,
-                index=sort_options.index(default_sort_label),
-            )
-            st.session_state.job_sort_order = "newest" if sort_label == "Newest first" else "oldest"
-
-            st.markdown("**Select tags:**")
-            categories = list(CATEGORY_LABELS.items())
-            for cat_key, cat_label in categories:
-                terms = list(summary.get(cat_key, {}).keys())
-                if not terms:
-                    continue
-                selected = st.multiselect(
-                    cat_label,
-                    options=terms,
-                    default=st.session_state.selected_filters.get(cat_key, []),
-                    key=f"filter_{cat_key}",
-                )
-                st.session_state.selected_filters[cat_key] = selected
-
-            if st.button("Clear Filters", use_container_width=True):
-                navigate_to(
-                    "reports",
-                    selected_run=st.session_state.selected_run,
-                    view_mode="explorer",
-                    viewing_job_id=None,
-                    selected_filters={},
-                    filter_mode="any",
-                    search_text="",
-                )
-                st.rerun()
-
-    # Keep URL synced with current filter state
-    _sync_url_with_state()
-
-    sort_order = st.session_state.get("job_sort_order", "newest")
-
     def _job_sort_key(job_id: int):
-        dt = job_dates.get(job_id)
-        if pd.isna(dt):
-            return datetime.min
-        return dt.to_pydatetime() if hasattr(dt, "to_pydatetime") else dt
-
-    reverse_sort = sort_order == "newest"
+        dt = posting_dates.get(job_id)
+        if dt is None:
+            return datetime.min if reverse_sort else datetime.max  # Unknown dates at end
+        return dt
+    
+    # Get job data from analysis (for requirements)
+    job_details = {j["id"]: j for j in analysis.get("job_details", [])}
     
     # Apply filters to get matching jobs
     all_selected_terms = []
@@ -2790,18 +2802,19 @@ def render_job_explorer():
     
     for job_id, job_data in job_details.items():
         reqs = job_data.get("requirements", {})
+        presence_reqs = reqs.get("presence", {}) if isinstance(reqs, dict) else reqs
         matched = set()
         
         for cat, term in all_selected_terms:
-            if term in reqs.get(cat, []):
+            if term in presence_reqs.get(cat, []):
                 matched.add((cat, term))
         
         if matched or not all_selected_terms:
             job_matches[job_id] = matched
     
     # Filter by search text
-    if search_text:
-        search_lower = search_text.lower()
+    if st.session_state.search_text:
+        search_lower = st.session_state.search_text.lower()
         filtered_ids = set()
         for job_id in job_matches:
             job_data = job_details.get(job_id, {})
@@ -2836,12 +2849,12 @@ def render_job_explorer():
     for cat, terms in st.session_state.selected_filters.items():
         for term in terms:
             active_filters.append((cat, term))
-    if active_filters or search_text:
+    if active_filters or st.session_state.search_text:
         col1, col2 = st.columns([3,1])
         with col1:
             filter_text = []
-            if search_text:
-                filter_text.append(f"🔎 {search_text}")
+            if st.session_state.search_text:
+                filter_text.append(f"🔎 {st.session_state.search_text}")
             for cat, term in active_filters:
                 cat_label = CATEGORY_LABELS.get(cat, cat)
                 filter_text.append(f"{cat_label}: {term}")
@@ -2918,10 +2931,16 @@ def render_job_explorer():
                         except (ValueError, AttributeError):
                             pass  # Keep days_ago_text empty if parsing fails
 
-                col1, col2 = st.columns([4, 1])
+                col1, col2, col3 = st.columns([0.25, 3, 1])
 
                 with col1:
-                    if st.button(f"{title} — {company}{days_ago_text}", key=f"job_title_{job_id}"):
+                    if days_ago_text:
+                        st.caption(f"🕒{days_ago_text.strip(' ()')}")
+                    elif date_text:
+                        st.caption(f"📅 {date_text}")
+
+                with col2:
+                    if st.button(f"{title} — {company}", key=f"job_title_{job_id}"):
                         navigate_to(
                             "reports",
                             selected_run=st.session_state.selected_run,
@@ -2929,10 +2948,8 @@ def render_job_explorer():
                             viewing_job_id=job_id,
                         )
                         st.rerun()
-                    if date_text:
-                        st.caption(f"📅 {date_text}")
 
-                with col2:
+                with col3:
                     if st.button("View", key=f"view_job_{job_id}", use_container_width=True):
                         navigate_to(
                             "reports",
@@ -3059,7 +3076,8 @@ def render_new_run_page():
     # ─────────────────────────────────────────────────────────────────────────
     # Search Parameters Section
     # ─────────────────────────────────────────────────────────────────────────
-    st.subheader("🔎 Search Parameters")
+    if search_mode == "Single Search":
+        st.subheader("🔎 Search Parameters")
     
     # Get bundles from settings
     bundles = settings.get("bundles", DEFAULT_SETTINGS.get("bundles", {}))
@@ -3089,27 +3107,74 @@ def render_new_run_page():
     else:  # Bundle Search
         # Bundle selection
         bundle_names = list(bundles.keys())
-        
+
         if not bundle_names:
             st.warning("No bundles configured. Add bundles in Settings or use Single Search mode.")
             return
-        
-        selected_bundles = st.multiselect(
-            "Select Bundle(s)",
-            options=bundle_names,
-            default=[bundle_names[0]] if bundle_names else [],
-            help="Select one or more keyword bundles to search",
-            key="new_run_selected_bundles"
-        )
+
+        # Create bundle table with checkboxes
+        st.subheader("📦 Select Bundles")
+
+        # Get last run times for each bundle
+        bundle_last_runs = {}
+        for bundle_name in bundle_names:
+            # Clean bundle name for folder matching
+            clean_name = re.sub(r'^\d+️⃣\s+', '', bundle_name)
+            clean_name = re.sub(r'\s*\([^)]*\)\s*$', '', clean_name)
+            clean_name = clean_name.strip()[:25].replace(' ', '_')
+            clean_name = re.sub(r'[<>:"/\\|?*]', '', clean_name)
+
+            # Find most recent folder with this bundle name
+            latest_time = None
+            if SCRAPED_DATA_DIR.exists():
+                for folder in SCRAPED_DATA_DIR.iterdir():
+                    if folder.is_dir() and folder.name.startswith(clean_name + '_'):
+                        # Extract timestamp from folder name
+                        timestamp_match = re.search(r'_(\d{8}_\d{6})$', folder.name)
+                        if timestamp_match:
+                            timestamp_str = timestamp_match.group(1)
+                            try:
+                                folder_time = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+                                if latest_time is None or folder_time > latest_time:
+                                    latest_time = folder_time
+                            except ValueError:
+                                pass
+
+            bundle_last_runs[bundle_name] = latest_time
+
+        # Display bundles in a table format
+        selected_bundles = []
+        for bundle_name in bundle_names:
+            col1, col2, col3 = st.columns([0.5, 3, 1.5])
+
+            with col1:
+                checkbox_key = f"bundle_checkbox_{bundle_name.replace(' ', '_').replace('(', '').replace(')', '')}"
+                is_selected = st.checkbox(
+                    f"Select {bundle_name}",
+                    key=checkbox_key,
+                    label_visibility="hidden"
+                )
+                if is_selected:
+                    selected_bundles.append(bundle_name)
+
+            with col2:
+                st.markdown(f"**{bundle_name}**")
+
+            with col3:
+                last_run = bundle_last_runs.get(bundle_name)
+                if last_run:
+                    st.caption(f"🕒 {last_run.strftime('%Y-%m-%d %H:%M')}")
+                else:
+                    st.caption("Never run")
 
         st.caption("Each phrase runs as a separate scrape; results are merged with early dedup.")
-        
+
         # Show what keywords are in the selected bundles
         if selected_bundles:
             all_keywords = []
             for bundle_name in selected_bundles:
                 all_keywords.extend(bundles.get(bundle_name, []))
-            
+
             with st.expander(f"📋 Keywords in selected bundle(s) ({len(all_keywords)} total)", expanded=False):
                 for bundle_name in selected_bundles:
                     bundle_keywords = bundles.get(bundle_name, [])

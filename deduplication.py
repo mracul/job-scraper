@@ -33,13 +33,19 @@ class Deduplicator:
         n_title = Deduplicator.normalize_text(job.title)
         n_company = Deduplicator.normalize_text(job.company)
         
-        # Create a simplified location (e.g., "Sydney NSW" -> "sydney")
-        # This helps match "Sydney" with "Sydney CBD" or "Sydney, Australia"
+        # Create a simplified location for cross-site deduplication
+        # Normalize suburbs to their parent city to catch cross-site duplicates
         n_location = Deduplicator.normalize_text(job.location)
-        if "sydney" in n_location:
+        
+        # Sydney metro area
+        sydney_suburbs = ["sydney", "auburn", "bankstown", "parramatta", "marrickville", "rydalmere", 
+                         "villawood", "macquarie park", "st leonards", "riverwood", "milsons point", "wetherill park"]
+        if any(suburb in n_location for suburb in sydney_suburbs) or "sydney" in n_location:
             n_location = "sydney"
+        # Melbourne metro area  
         elif "melbourne" in n_location:
             n_location = "melbourne"
+        # Brisbane metro area
         elif "brisbane" in n_location:
             n_location = "brisbane"
         

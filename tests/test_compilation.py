@@ -53,7 +53,7 @@ def test_build_ai_summary_input_real_data_includes_all_categories_and_valid_pcts
     assert analysis is not None
 
     total_jobs = int(analysis.get("total_jobs", 0) or 0)
-    summary = analysis.get("summary", {}) or {}
+    summary = analysis.get("summary", {}) or analysis.get("presence", {}) or {}
 
     ai_input = _build_ai_summary_input(
         total_jobs=total_jobs,

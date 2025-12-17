@@ -57,7 +57,7 @@ def merge_analyses(analyses: list[dict], *, category_keys: Iterable[str]) -> dic
             continue
         total_jobs += int(analysis.get("total_jobs", 0) or 0)
 
-        summary = analysis.get("summary", {}) or {}
+        summary = analysis.get("summary", {}) or analysis.get("presence", {}) or {}
         for cat in keys:
             items = summary.get(cat, {}) or {}
             bucket = merged_summary.setdefault(cat, {})

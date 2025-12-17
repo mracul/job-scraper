@@ -39,6 +39,7 @@ class JobCollection:
         self.run_folder: Optional[str] = None
         self.search_keywords: Optional[str] = None
         self.search_location: Optional[str] = None
+        self.bundle_names: Optional[list[str]] = None  # For bundled scrapes
 
     def add(self, job: Job):
         """Add a job to the collection."""
@@ -53,12 +54,30 @@ class JobCollection:
         self.search_keywords = keywords
         self.search_location = location
 
+    def set_bundle_params(self, bundle_names: list[str]):
+        """Store bundle information for bundled scrapes."""
+        self.bundle_names = bundle_names
+
     def create_run_folder(self, base_folder: str = "scraped_data") -> str:
-        """Create a folder for this scraping run named after search params."""
+        """Create a folder for this scraping run named after search params or bundle."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # Create folder name from search params if available
-        if self.search_keywords and self.search_location:
+        # For bundled scrapes, use bundle name + timestamp
+        if self.bundle_names:
+            # Create a bundle name from the selected bundles
+            # Remove emoji prefix (like "1️⃣ ", "2️⃣ ") and clean up
+            bundle_name = self.bundle_names[0]
+            # Remove emoji number prefix
+            bundle_name = re.sub(r'^\d+️⃣\s+', '', bundle_name)
+            # Remove time descriptors in parentheses
+            bundle_name = re.sub(r'\s*\([^)]*\)\s*$', '', bundle_name)
+            # Take first few words and make it filesystem safe
+            bundle_name = bundle_name.strip()[:25].replace(' ', '_')
+            # Final sanitization
+            safe_bundle = re.sub(r'[<>:"/\\|?*]', '', bundle_name)
+            folder_name = f"{safe_bundle}_{timestamp}"
+        # For regular searches, use keywords + location + timestamp
+        elif self.search_keywords and self.search_location:
             # Sanitize for filesystem
             safe_keywords = re.sub(r'[<>:"/\\|?*]', '', self.search_keywords)[:30].strip().replace(' ', '_')
             safe_location = re.sub(r'[<>:"/\\|?*]', '', self.search_location)[:20].strip().replace(' ', '_')

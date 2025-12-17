@@ -491,6 +491,10 @@ Examples:
     primary_keywords = keywords_list[0] if keywords_list else keywords
     collection.set_search_params(primary_keywords, location)
     
+    # Set bundle information for folder naming
+    if bundle_ids:
+        collection.set_bundle_params(bundle_ids)
+    
     # Store bundle metadata for compiled_jobs.md
     bundle_metadata = None
     if keywords_list:
