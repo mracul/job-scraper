@@ -521,7 +521,7 @@ div.stButton > button {
                 status = "• ℹ️ generated"
 
             st.markdown(
-                f"### 🤖 AI Summary <span style='opacity:0.65;font-size:0.9em;'>{status}</span>",
+                f"### 🤖 AI Summary <span style='opacity:0.6;font-size:0.85em;'>{status}</span>",
                 unsafe_allow_html=True,
             )
 
